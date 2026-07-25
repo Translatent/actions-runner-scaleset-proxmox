@@ -170,7 +170,8 @@ type profileState struct {
 	warmSize atomic.Int32
 	// refill is a per-profile signal channel so a profile's
 	// reconcile loop can be nudged without waking sibling loops.
-	refill chan struct{}
+	refill            chan struct{}
+	cloneReservations atomic.Int32
 }
 
 // manager is the in-process Manager implementation.
@@ -1342,7 +1343,11 @@ func (m *manager) reconcileProfileOnce(ctx context.Context, profile string) {
 	hotSize := int(ps.hotSize.Load())
 	warmSize := int(ps.warmSize.Load())
 	desired := int(ps.desiredCount.Load())
-	needHot, needWarm := computeCloneNeeds(stats, m.prov.InFlightCloneCount(),
+	inflight := m.prov.InFlightCloneCount()
+	if reserved := int(ps.cloneReservations.Load()); reserved > inflight {
+		inflight = reserved
+	}
+	needHot, needWarm := computeCloneNeeds(stats, inflight,
 		hotProv, warmProv, hotSize, warmSize, desired, ps.settings.MaxConcurrentRunners)
 
 	// Promote warm -> hot first (cheap).
@@ -1617,12 +1622,23 @@ func (m *manager) kickClone(ctx context.Context, profile string, kind store.Pool
 		m.log.Debug("clone: dropping spawn (semaphore unavailable)", "profile", profile, "kind", kind, "err", err)
 		return
 	}
+	ps := m.profileOf(profile)
+	if ps == nil {
+		m.cloneSem.Release(1)
+		m.log.Warn("clone: unknown profile; aborting reservation", "profile", profile)
+		return
+	}
+	// Reserve synchronously, before the goroutine can be scheduled.
+	// Provisioner.InFlightCloneCount starts later, inside Clone; without
+	// this bridge rapid refill signals can dispatch duplicate replacements.
+	ps.cloneReservations.Add(1)
 	m.wg.Add(1)
 	var vmid int
 	// runClone derives its own context from m.workerCtx; the caller's
 	// ctx scopes the reconcile pass, not the clone lifetime.
 	go func() { //nolint:contextcheck // clone outlives the reconcile-tick ctx
 		defer m.wg.Done()
+		defer ps.cloneReservations.Add(-1)
 		defer func() { m.logRecoveredPanic("clone", vmid, recover()) }()
 		defer m.cloneSem.Release(1)
 		m.runClone(profile, kind, poweredOn, &vmid)

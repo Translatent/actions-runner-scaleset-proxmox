@@ -717,6 +717,37 @@ func TestComputeCloneNeeds(t *testing.T) {
 	}
 }
 
+// TestReconcile_CloneReservationClosesDispatchAccountingGap pins the
+// refill-storm race seen in production: kickClone returned before its goroutine
+// reached prepareClone/Provisioner.Clone, so a second refill observed neither a
+// provisioning row nor an in-flight Proxmox clone and dispatched a duplicate.
+func TestReconcile_CloneReservationClosesDispatchAccountingGap(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1, MaxConcurrentRunners: 2})
+
+	// Hold allocation so the first clone goroutine cannot insert its
+	// Provisioning row. The synchronous reservation must still be visible to
+	// the second reconcile pass.
+	mgr.allocMu.Lock()
+	mgr.reconcileProfileOnce(context.Background(), mgr.defaultProfile())
+	mgr.reconcileProfileOnce(context.Background(), mgr.defaultProfile())
+	mgr.allocMu.Unlock()
+
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return len(fp.clones) == 1
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// Let the boot worker settle before the test cleanup drains the manager.
+	require.Eventually(t, func() bool {
+		stats, err := mgr.Stats(context.Background())
+		return err == nil && stats.Hot == 1
+	}, 2*time.Second, 10*time.Millisecond)
+}
+
 func TestAllocateVMID_AvoidsCollisions(t *testing.T) {
 	t.Parallel()
 	st := newTestStore(t)
