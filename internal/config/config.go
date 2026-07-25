@@ -259,6 +259,14 @@ type GitHubConfig struct {
 	// runner-went-offline subcase; shorter because offline is a
 	// stronger failure signal.
 	AssignedOfflineGrace Duration `yaml:"assigned_offline_grace"`
+
+	// RunningOfflineGrace is the minimum continuous period for which a
+	// running VM's GitHub runner may be offline or absent before it can be
+	// reclaimed. RunningOfflineObservations is an additional consecutive
+	// observation floor, protecting active jobs from a single stale runner
+	// list response.
+	RunningOfflineGrace        Duration `yaml:"running_offline_grace"`
+	RunningOfflineObservations int      `yaml:"running_offline_observations"`
 }
 
 // GitHubAppConfig configures GitHub App authentication. Exactly one of
@@ -1230,6 +1238,10 @@ func (c *Config) ApplyDefaults() {
 	c.GitHub.AssignedGrace.setDefault(5 * time.Minute)
 	c.GitHub.RunningIdleGrace.setDefault(30 * time.Second)
 	c.GitHub.AssignedOfflineGrace.setDefault(2 * time.Minute)
+	c.GitHub.RunningOfflineGrace.setDefault(2 * time.Minute)
+	if c.GitHub.RunningOfflineObservations == 0 {
+		c.GitHub.RunningOfflineObservations = 8
+	}
 	// Proxmox.Clone default is captured in CloneConfig.LinkedOrDefault.
 	// Cluster
 	if c.Cluster.Mode == "" {
@@ -1417,6 +1429,12 @@ func (c *Config) Resolve() error {
 	}
 	if c.Pool.CloneInflightGrace.D() <= 0 {
 		return errors.New("pool.clone_inflight_grace must be positive")
+	}
+	if c.GitHub.RunningOfflineGrace.D() <= 0 {
+		return errors.New("github.running_offline_grace must be positive")
+	}
+	if c.GitHub.RunningOfflineObservations <= 0 {
+		return errors.New("github.running_offline_observations must be positive")
 	}
 	// Profiles: per-profile vm_max_age must be positive when set.
 	// Empty inherits from pool (already applied in ApplyDefaults, so

@@ -64,6 +64,12 @@ type Config struct {
 	// failure than an idle one.
 	AssignedOfflineGrace time.Duration
 
+	// RunningOfflineGrace and RunningOfflineObservations are both required
+	// before an in-flight VM can be reclaimed after GitHub reports its runner
+	// offline or missing. A healthy observation resets the sequence.
+	RunningOfflineGrace        time.Duration
+	RunningOfflineObservations int
+
 	// OrphanGrace is how long a Proxmox VM may exist without a matching
 	// store row before sweepProxmoxOrphans destroys it. Must exceed the
 	// typical Clone → guest-agent-ready → JIT-inject worst case;
@@ -95,6 +101,12 @@ func (c Config) Validate() error {
 	}
 	if c.RunningIdleGrace <= 0 {
 		return errors.New("gh: running_idle_grace must be > 0")
+	}
+	if c.RunningOfflineGrace <= 0 {
+		return errors.New("gh: running_offline_grace must be > 0")
+	}
+	if c.RunningOfflineObservations <= 0 {
+		return errors.New("gh: running_offline_observations must be > 0")
 	}
 	if c.OrphanGrace <= 0 {
 		return errors.New("gh: orphan_grace must be > 0")
@@ -133,6 +145,13 @@ type Reconciler struct {
 	// reappears in the store rows snapshot.
 	orphanProxmoxFirstSeen map[int]time.Time
 
+	// runningUnhealthy tracks consecutive offline/missing observations for a
+	// VM that the store still considers Running. Both unhealthy labels share
+	// one sequence because either means GitHub cannot currently prove the job
+	// is alive. Any busy/idle observation, or disappearance from the Running
+	// row set, resets the sequence.
+	runningUnhealthy map[int]unhealthyObservation
+
 	now func() time.Time // injected for tests
 }
 
@@ -169,8 +188,14 @@ func New(cfg Config, gh *github.Client, p pool.Manager, prov provisioner.Provisi
 		metrics:                metrics,
 		orphanFirstSeen:        make(map[string]time.Time),
 		orphanProxmoxFirstSeen: make(map[int]time.Time),
+		runningUnhealthy:       make(map[int]unhealthyObservation),
 		now:                    time.Now,
 	}, nil
+}
+
+type unhealthyObservation struct {
+	first time.Time
+	count int
 }
 
 // orphanGrace is how long a runner must have been observed unmatched
@@ -518,10 +543,12 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 	{dbState: "running", ghLabel: "offline"}: {
 		op:         opDestroy,
 		destroyMsg: "running: runner went offline",
+		grace:      func(c Config) time.Duration { return c.RunningOfflineGrace },
 	},
 	{dbState: "running", ghLabel: "missing"}: {
 		op:         opDestroy,
 		destroyMsg: "running: runner missing from GitHub",
+		grace:      func(c Config) time.Duration { return c.RunningOfflineGrace },
 	},
 
 	// hot: pre-JIT pool. Only the busy-without-promote case is
@@ -543,18 +570,40 @@ var stateTransitionTable = map[transitionKey]transitionAction{
 // [stateTransitionTable], and fires the cell's action. The transition
 // table is the documentation for the reconciler's behaviour.
 func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, runners map[string]pool.RunnerInfo) {
-	now := time.Now()
+	now := r.now()
+	runningRows := make(map[int]struct{})
 	for _, row := range rows {
 		gr, present := runners[row.Name]
 		ghLabel := ghStateLabel(gr, present)
 		age := now.Sub(row.StateSince)
+		if row.State == "running" {
+			runningRows[row.VMID] = struct{}{}
+			if ghLabel == "offline" || ghLabel == "missing" {
+				obs := r.runningUnhealthy[row.VMID]
+				if obs.count == 0 {
+					obs.first = now
+				}
+				obs.count++
+				r.runningUnhealthy[row.VMID] = obs
+			} else {
+				delete(r.runningUnhealthy, row.VMID)
+			}
+		}
 
 		action, ok := stateTransitionTable[transitionKey{dbState: row.State, ghLabel: ghLabel}]
 		if !ok || action.op == opNoop {
 			continue
 		}
-		if action.grace != nil && age < action.grace(r.cfg) {
-			continue
+		if action.grace != nil {
+			grace := action.grace(r.cfg)
+			if row.State == "running" && (ghLabel == "offline" || ghLabel == "missing") {
+				obs := r.runningUnhealthy[row.VMID]
+				if obs.count < r.cfg.RunningOfflineObservations || now.Sub(obs.first) < grace {
+					continue
+				}
+			} else if age < grace {
+				continue
+			}
 		}
 		switch action.op { //nolint:exhaustive // opNoop is short-circuited above
 		case opPromote:
@@ -569,6 +618,11 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 			}
 		case opDestroy:
 			r.forceDestroy(ctx, row.VMID, action.destroyMsg, row.State, ghLabel)
+		}
+	}
+	for vmid := range r.runningUnhealthy {
+		if _, ok := runningRows[vmid]; !ok {
+			delete(r.runningUnhealthy, vmid)
 		}
 	}
 }

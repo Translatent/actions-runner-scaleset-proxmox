@@ -199,14 +199,16 @@ func silentLogger() *slog.Logger {
 
 func baseCfg() Config {
 	return Config{
-		Scope:                githubauth.Scope{Repo: "octocat/test"},
-		PollInterval:         15 * time.Second,
-		AssignedGrace:        5 * time.Minute,
-		RunningIdleGrace:     30 * time.Second,
-		AssignedOfflineGrace: 2 * time.Minute,
-		OrphanGrace:          60 * time.Second,
-		RunnerNamePrefix:     "gh-runner-test-",
-		ScaleSetName:         "test",
+		Scope:                      githubauth.Scope{Repo: "octocat/test"},
+		PollInterval:               15 * time.Second,
+		AssignedGrace:              5 * time.Minute,
+		RunningIdleGrace:           30 * time.Second,
+		AssignedOfflineGrace:       2 * time.Minute,
+		RunningOfflineGrace:        2 * time.Minute,
+		RunningOfflineObservations: 8,
+		OrphanGrace:                60 * time.Second,
+		RunnerNamePrefix:           "gh-runner-test-",
+		ScaleSetName:               "test",
 	}
 }
 
@@ -354,8 +356,8 @@ func TestReconcile_RunningIdle_Destroys(t *testing.T) {
 	require.Contains(t, mgr.destroyCalls[0].Reason, "missed JobCompleted")
 }
 
-// 8. running + offline → destroy
-func TestReconcile_RunningOffline_Destroys(t *testing.T) {
+// 8. running + offline → destroy only after consecutive grace
+func TestReconcile_RunningOffline_DestroysAfterConsecutiveGrace(t *testing.T) {
 	t.Parallel()
 	srv := runnersServer(t, []fakeRunner{
 		{id: 202, name: "gh-runner-test-2003", status: "offline", busy: false},
@@ -368,14 +370,21 @@ func TestReconcile_RunningOffline_Destroys(t *testing.T) {
 	}}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	for range 7 {
+		require.NoError(t, r.Tick(context.Background()))
+		now = now.Add(20 * time.Second)
+	}
+	require.Empty(t, mgr.destroyCalls)
 	require.NoError(t, r.Tick(context.Background()))
 
 	require.Len(t, mgr.destroyCalls, 1)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "offline")
 }
 
-// 9. running + missing → destroy
-func TestReconcile_RunningMissing_Destroys(t *testing.T) {
+// 9. running + missing → destroy only after consecutive grace
+func TestReconcile_RunningMissing_DestroysAfterConsecutiveGrace(t *testing.T) {
 	t.Parallel()
 	srv := runnersServer(t, []fakeRunner{})
 	defer srv.Close()
@@ -386,6 +395,13 @@ func TestReconcile_RunningMissing_Destroys(t *testing.T) {
 	}}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	for range 7 {
+		require.NoError(t, r.Tick(context.Background()))
+		now = now.Add(20 * time.Second)
+	}
+	require.Empty(t, mgr.destroyCalls)
 	require.NoError(t, r.Tick(context.Background()))
 
 	require.Len(t, mgr.destroyCalls, 1)

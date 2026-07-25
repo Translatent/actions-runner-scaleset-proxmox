@@ -760,14 +760,16 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 	}
 
 	rec, err := gh.New(gh.Config{
-		Scope:                scope,
-		ScaleSetName:         entry.Name,
-		PollInterval:         cfg.GitHub.PollInterval.D(),
-		AssignedGrace:        cfg.GitHub.AssignedGrace.D(),
-		RunningIdleGrace:     cfg.GitHub.RunningIdleGrace.D(),
-		AssignedOfflineGrace: cfg.GitHub.AssignedOfflineGrace.D(),
-		OrphanGrace:          cfg.Pool.OrphanGrace.D(),
-		RunnerNamePrefix:     state.vmPrefix,
+		Scope:                      scope,
+		ScaleSetName:               entry.Name,
+		PollInterval:               cfg.GitHub.PollInterval.D(),
+		AssignedGrace:              cfg.GitHub.AssignedGrace.D(),
+		RunningIdleGrace:           cfg.GitHub.RunningIdleGrace.D(),
+		AssignedOfflineGrace:       cfg.GitHub.AssignedOfflineGrace.D(),
+		RunningOfflineGrace:        cfg.GitHub.RunningOfflineGrace.D(),
+		RunningOfflineObservations: cfg.GitHub.RunningOfflineObservations,
+		OrphanGrace:                cfg.Pool.OrphanGrace.D(),
+		RunnerNamePrefix:           state.vmPrefix,
 	}, restCli, mgr, state.prov, log, metrics)
 	if err != nil {
 		return fmt.Errorf("build gh reconciler: %w", err)

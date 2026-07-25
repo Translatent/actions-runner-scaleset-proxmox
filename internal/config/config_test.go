@@ -482,6 +482,8 @@ github:
   assigned_grace: 99m
   running_idle_grace: 11s
   assigned_offline_grace: 45s
+  running_offline_grace: 3m
+  running_offline_observations: 12
 scaleset: { name: x, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
@@ -502,6 +504,8 @@ pool: {}
 	require.Equal(t, 99*time.Minute, cfg.GitHub.AssignedGrace.D())
 	require.Equal(t, 11*time.Second, cfg.GitHub.RunningIdleGrace.D())
 	require.Equal(t, 45*time.Second, cfg.GitHub.AssignedOfflineGrace.D())
+	require.Equal(t, 3*time.Minute, cfg.GitHub.RunningOfflineGrace.D())
+	require.Equal(t, 12, cfg.GitHub.RunningOfflineObservations)
 }
 
 func TestParse_AppAuthRequiresAppBlock(t *testing.T) {
