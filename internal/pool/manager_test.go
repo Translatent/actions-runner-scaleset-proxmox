@@ -269,7 +269,8 @@ func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner,
 	require.NoError(t, err)
 
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
-	var w io.Writer = io.Discard //nolint:staticcheck // explicit interface type required so reassignment to testWriter compiles
+	var w io.Writer
+	w = io.Discard
 	if testing.Verbose() {
 		w = testWriter{t}
 	}
