@@ -14,6 +14,7 @@ import (
 // httpFault (count == 0) matches nothing.
 type httpFault struct {
 	status     int
+	message    string
 	retryAfter int // seconds; emitted as Retry-After when > 0
 	count      int
 }
@@ -37,6 +38,19 @@ func (s *Server) InjectDeleteFailure(status, count int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deleteFault = httpFault{status: status, count: count}
+}
+
+// InjectActiveRunnerDeleteRejection makes the next count runner-DELETE
+// calls return GitHub's active-job rejection. Reconciler tests use this
+// as the authoritative proof that a Running VM must be retained.
+func (s *Server) InjectActiveRunnerDeleteRejection(count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteFault = httpFault{
+		status:  http.StatusUnprocessableEntity,
+		message: "runner is currently running a job and cannot be deleted",
+		count:   count,
+	}
 }
 
 // takeListFaultLocked returns the active list fault (if any) and

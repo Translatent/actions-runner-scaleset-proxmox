@@ -617,7 +617,7 @@ func (r *Reconciler) applyMatrix(ctx context.Context, rows []pool.RowSnapshot, r
 				r.recordMismatch(row.State, ghLabel, action.mismatchKind)
 			}
 		case opDestroy:
-			r.forceDestroy(ctx, row.VMID, action.destroyMsg, row.State, ghLabel)
+			r.forceDestroy(ctx, row.VMID, row.RunnerID, action.destroyMsg, row.State, ghLabel)
 		}
 	}
 	for vmid := range r.runningUnhealthy {
@@ -713,7 +713,9 @@ func (r *Reconciler) pruneOrphanTracking(known map[string]struct{}, runners map[
 
 // removeRunner deregisters one GitHub runner by ID, owning the per-call
 // timeout, the org-vs-repo scope dispatch, and the failure metric.
-// Returns nil on success (the caller drops its tracking entry) or the
+// A 404 is success: runner deletion is idempotent, and the pool's
+// post-destroy orphan cleanup may race a successful reconciler preflight.
+// Returns nil on success/not-found (the caller drops its tracking entry) or the
 // error after recording github_errors (the caller leaves the entry for
 // a next-tick retry).
 func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
@@ -727,6 +729,11 @@ func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
 		_, err = r.gh.Actions.RemoveRunner(rmCtx, owner, repo, id)
 	}
 	if err != nil {
+		var responseErr *github.ErrorResponse
+		if errors.As(err, &responseErr) && responseErr.Response != nil &&
+			responseErr.Response.StatusCode == http.StatusNotFound {
+			return nil
+		}
 		if r.metrics != nil {
 			r.metrics.GitHubErrors.WithLabelValues(r.cfg.ScaleSetName, "remove_runner").Inc()
 		}
@@ -795,12 +802,40 @@ func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSna
 	}
 }
 
-func (r *Reconciler) forceDestroy(ctx context.Context, vmid int, reason, dbState, ghLabel string) {
+func (r *Reconciler) forceDestroy(
+	ctx context.Context,
+	vmid int,
+	runnerID int64,
+	reason, dbState, ghLabel string,
+) {
+	// A Running row is never safe to destroy based on a runner-list
+	// observation alone. GitHub's deletion endpoint is the authoritative
+	// active-job gate: it rejects deletion while the runner still owns a job.
+	// Any inconclusive response fails closed and leaves both VM and row intact
+	// for a later tick.
+	if dbState == "running" {
+		if runnerID == 0 {
+			r.protectRunningDestroy(vmid, runnerID, reason, errors.New("runner ID is unset"))
+			return
+		}
+		if err := r.removeRunner(ctx, runnerID); err != nil {
+			r.protectRunningDestroy(vmid, runnerID, reason, err)
+			return
+		}
+	}
 	if err := r.pool.ForceDestroy(ctx, vmid, reason); err != nil {
 		r.log.Warn("reconcile: force destroy failed", "vmid", vmid, "err", err)
 		return
 	}
 	r.recordMismatch(dbState, ghLabel, "destroy")
+}
+
+func (r *Reconciler) protectRunningDestroy(vmid int, runnerID int64, reason string, err error) {
+	r.log.Warn("reconcile: retaining running VM after runner-delete preflight",
+		"vmid", vmid, "runner_id", runnerID, "reason", reason, "err", err)
+	if r.metrics != nil {
+		r.metrics.ReconcileErrors.WithLabelValues(r.cfg.ScaleSetName, "protect_running").Inc()
+	}
 }
 
 func (r *Reconciler) recordMismatch(dbState, ghState, action string) {

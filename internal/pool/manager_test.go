@@ -232,6 +232,13 @@ func (tw testWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func testLogWriter(t *testing.T) io.Writer {
+	if testing.Verbose() {
+		return testWriter{t}
+	}
+	return io.Discard
+}
+
 // ---------- Helpers ----------
 
 func newTestStore(t *testing.T) *store.Store {

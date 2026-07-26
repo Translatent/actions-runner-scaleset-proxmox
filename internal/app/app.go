@@ -696,8 +696,10 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
 		TemplateNode:         state.prov.TemplateNode(),
 		VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
-		OnRunnerOrphaned:     ghClient.RemoveRunner,
-		RunnerLister:         gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
+		OnRunnerOrphaned: func(ctx context.Context, runnerID int64) error {
+			return removeRunnerIdempotently(ctx, runnerID, ghClient.RemoveRunner)
+		},
+		RunnerLister: gh.NewRunnerLister(restCli, scope, state.vmPrefix, log),
 	}, st, state.prov, sel, log, metrics)
 	if err != nil {
 		return fmt.Errorf("init pool: %w", err)
@@ -791,6 +793,18 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		return runSwallowCancel(func() error { return lst.Run(ctxg, sc) })
 	})
 	return g.Wait()
+}
+
+func removeRunnerIdempotently(
+	ctx context.Context,
+	runnerID int64,
+	remove func(context.Context, int64) error,
+) error {
+	err := remove(ctx, runnerID)
+	if errors.Is(err, scaleset.RunnerNotFoundError) {
+		return nil
+	}
+	return err
 }
 
 // runSwallowCancel runs fn and treats context.Canceled as a clean exit
