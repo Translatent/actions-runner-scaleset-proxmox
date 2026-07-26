@@ -1,0 +1,76 @@
+name: check-ci-failure-reporter
+
+on:
+  workflow_call:
+    inputs:
+      force_failure:
+        description: Exercise the durable reporter-failure issue path without changing a secret.
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      FORGE_ANOMALY_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    # Keep the health check independent from the self-hosted CI it protects.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate reporter credential
+        id: probe
+        continue-on-error: true
+        env:
+          FORCE_FAILURE: ${{ inputs.force_failure }}
+          FORGE_ANOMALY_TOKEN: ${{ secrets.FORGE_ANOMALY_TOKEN }}
+        run: |
+          set -euo pipefail
+          token="$FORGE_ANOMALY_TOKEN"
+          if [ "$FORCE_FAILURE" = "true" ]; then
+            token="deliberately-invalid-reporter-health-token"
+          fi
+          response="$(curl --fail-with-body --silent --show-error \
+            --config <(printf 'header = "Cookie: translatent_session=%s"\n' "$token") \
+            https://forge.translatent.ai/api/auth/me)"
+          unset token
+          jq -e '.id == "anomaly-reporter"' <<<"$response" >/dev/null
+      - name: Surface unhealthy reporter
+        if: steps.probe.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="[automation] CI failure reporter is broken"
+          issue_number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)"
+          body="The scheduled CI failure reporter health check could not authenticate to Forge.
+
+          Health run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          No credential value is included. Repair or rotate the repo-scoped FORGE_ANOMALY_TOKEN and rerun this workflow."
+          if [ -n "$issue_number" ]; then
+            gh issue comment "$issue_number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          exit 1
+      - name: Close recovered reporter issue
+        if: steps.probe.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="[automation] CI failure reporter is broken"
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" |
+          while IFS= read -r issue_number; do
+            [ -n "$issue_number" ] || continue
+            gh issue close "$issue_number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Reporter credential recovered in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          done

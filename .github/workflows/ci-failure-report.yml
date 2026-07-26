@@ -28,7 +28,7 @@ jobs:
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.name != 'ci-failure-report'
-    uses: Translatent/translatent-deploy-config/.github/workflows/report-ci-failure.yml@main
+    uses: ./.github/workflows/report-ci-failure.yml
     with:
       repo: ${{ github.repository }}
       workflow_name: ${{ github.event.workflow_run.name }}
@@ -40,7 +40,7 @@ jobs:
 
   health:
     if: github.event_name != 'workflow_run'
-    uses: Translatent/translatent-deploy-config/.github/workflows/check-ci-failure-reporter.yml@main
+    uses: ./.github/workflows/check-ci-failure-reporter.yml
     with:
       force_failure: ${{ inputs.self_test_failure || false }}
     secrets:

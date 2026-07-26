@@ -1,0 +1,150 @@
+# Reusable reporter for repositories that adopt ci-failure-report.yml. Add the
+# caller stub and a repo-scoped FORGE_ANOMALY_TOKEN secret to onboard a repo.
+name: report-ci-failure
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        required: true
+        type: string
+      workflow_name:
+        required: true
+        type: string
+      run_id:
+        required: true
+        type: string
+      run_url:
+        required: true
+        type: string
+      conclusion:
+        required: true
+        type: string
+    secrets:
+      FORGE_ANOMALY_TOKEN:
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    # The reporter must not share the Linux scaleset whose failures it reports.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report failed main workflow
+        id: report
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.repo }}
+          WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          RUN_ID: ${{ inputs.run_id }}
+          RUN_URL: ${{ inputs.run_url }}
+          CONCLUSION: ${{ inputs.conclusion }}
+          FORGE_ANOMALY_TOKEN: ${{ secrets.FORGE_ANOMALY_TOKEN }}
+        run: |
+          set -euo pipefail
+          jobs="$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
+          failed_jobs="$(jq -r '[.jobs[] | select(.conclusion == "failure") | .name] | if length == 0 then ["workflow failed without a failed job"] else . end | join("\n")' <<<"$jobs")"
+          log_tail="$(printf 'Failed jobs:\n%s' "$failed_jobs")"
+          failed_job_count="$(jq '[.jobs[] | select(.conclusion == "failure")] | length' <<<"$jobs")"
+          if [ "$failed_job_count" -gt 0 ]; then
+            while IFS= read -r failed_job; do
+              job_id="$(jq -r '.id' <<<"$failed_job")"
+              job_name="$(jq -r '.name' <<<"$failed_job")"
+              job_log="$(curl -L --fail-with-body --silent --show-error \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com/repos/$REPO/actions/jobs/$job_id/logs" || true)"
+              printf -v log_tail '%s\n\n=== %s (last 150 lines) ===\n%s' \
+                "$log_tail" "$job_name" "$(tail -n 150 <<<"$job_log")"
+            done < <(jq -c '.jobs[] | select(.conclusion == "failure") | {id, name}' <<<"$jobs")
+          fi
+          log_tail="$(tail -c 14000 <<<"$log_tail")"
+          repo_name="${REPO##*/}"
+          payload="$(jq -nc \
+            --arg service "ci:$repo_name" \
+            --arg digest "$WORKFLOW_NAME:$RUN_ID" \
+            --arg snapshot "run_url=$RUN_URL conclusion=$CONCLUSION" \
+            --arg log_tail "$log_tail" \
+            '{service:$service,digest:$digest,anomaly_class:"ci_failure",health_snapshot:$snapshot,log_tail:$log_tail}')"
+          response="$(curl --fail-with-body --silent --show-error \
+            --config <(printf 'header = "Cookie: translatent_session=%s"\n' "$FORGE_ANOMALY_TOKEN") \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            https://forge.translatent.ai/api/intake/anomaly)"
+          normalize_component() {
+            printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g' | awk '
+            {
+              out=""; in_sep=0
+              for (i=1; i<=length($0); i++) {
+                c=substr($0,i,1); sep=(c == "-" || c == "_" || c == ".")
+                if (!sep || !in_sep) out=out c
+                in_sep=sep
+              }
+              sub(/^[-_.]+/, "", out); sub(/[-_.]+$/, "", out)
+              printf "%s", (out == "" ? "unknown" : out)
+            }'
+          }
+          repo_component="$(normalize_component "$repo_name")"
+          workflow_component="$(normalize_component "$WORKFLOW_NAME")"
+          expected_fingerprint="anomaly:ci_failure:ci:$repo_component:$workflow_component"
+          jq -e --arg fingerprint "$expected_fingerprint" '
+            .fingerprint == $fingerprint and
+            .notification_policy == "background_diagnosis" and
+            .admin_page_requested == false and
+            .operator_signal_delivered == false and
+            .operator_signal_suppressed == true and
+            (
+              (.filed == true and (.task_id | type) == "number" and .task_id > 0 and .reason == "accepted") or
+              (.filed == false and (.reason | type) == "string" and (.reason | length) > 0 and has("dedup_task_id"))
+            )
+          ' <<<"$response" >/dev/null
+      - name: Surface reporter failure
+        if: steps.report.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.repo }}
+          FAILED_RUN_URL: ${{ inputs.run_url }}
+        run: |
+          set -euo pipefail
+          title="[automation] CI failure reporter is broken"
+          issue_number="$(gh issue list --repo "$REPO" --state open \
+            --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)"
+          body="The CI failure reporter could not forward a failed workflow to Forge.
+
+          Failed workflow: $FAILED_RUN_URL
+          Reporter run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          No credential value is included. Repair or rotate the repo-scoped FORGE_ANOMALY_TOKEN, then run the reporter health check."
+          if [ -n "$issue_number" ]; then
+            gh issue comment "$issue_number" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+          exit 1
+      - name: Close recovered reporter issue
+        if: steps.report.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+          title="[automation] CI failure reporter is broken"
+          gh issue list --repo "$REPO" --state open \
+            --search "\"$title\" in:title" --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" |
+          while IFS= read -r issue_number; do
+            [ -n "$issue_number" ] || continue
+            gh issue close "$issue_number" --repo "$REPO" \
+              --comment "Reporter delivery recovered in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          done
