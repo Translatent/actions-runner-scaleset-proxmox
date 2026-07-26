@@ -12,11 +12,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/actions/scaleset"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/nodeselector"
 )
+
+func TestRemoveRunnerIdempotently(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, removeRunnerIdempotently(
+		context.Background(),
+		42,
+		func(context.Context, int64) error { return scaleset.RunnerNotFoundError },
+	))
+
+	wantErr := errors.New("delete failed")
+	require.ErrorIs(t, removeRunnerIdempotently(
+		context.Background(),
+		42,
+		func(context.Context, int64) error { return wantErr },
+	), wantErr)
+}
 
 func TestPortFromAddr(t *testing.T) {
 	t.Parallel()

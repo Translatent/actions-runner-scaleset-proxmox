@@ -232,6 +232,13 @@ func (tw testWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func testLogWriter(t *testing.T) io.Writer {
+	if testing.Verbose() {
+		return testWriter{t}
+	}
+	return io.Discard
+}
+
 // ---------- Helpers ----------
 
 func newTestStore(t *testing.T) *store.Store {
@@ -269,10 +276,7 @@ func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner,
 	require.NoError(t, err)
 
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
-	var w io.Writer = io.Discard //nolint:staticcheck // explicit interface type required so reassignment to testWriter compiles
-	if testing.Verbose() {
-		w = testWriter{t}
-	}
+	w := testLogWriter(t)
 	log := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	mi, err := NewManager(cfg, st, prov, sel, log, metrics)
 	require.NoError(t, err)

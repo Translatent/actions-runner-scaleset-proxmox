@@ -24,6 +24,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
 )
 
 // ---------------------------------------------------------------------------
@@ -60,11 +61,19 @@ func runnersServer(t *testing.T, runners []fakeRunner) *httptest.Server {
 	require.NoError(t, err)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(enc)
 	})
-	mux.HandleFunc("/orgs/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/orgs/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(enc)
 	})
@@ -346,7 +355,7 @@ func TestReconcile_RunningIdle_Destroys(t *testing.T) {
 
 	mgr := &fakeManager{rows: []pool.RowSnapshot{
 		{VMID: 2002, Name: "gh-runner-test-2002", State: "running",
-			StateSince: time.Now().Add(-time.Minute)},
+			RunnerID: 201, StateSince: time.Now().Add(-time.Minute)},
 	}}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
@@ -366,7 +375,7 @@ func TestReconcile_RunningOffline_DestroysAfterConsecutiveGrace(t *testing.T) {
 
 	mgr := &fakeManager{rows: []pool.RowSnapshot{
 		{VMID: 2003, Name: "gh-runner-test-2003", State: "running",
-			StateSince: time.Now().Add(-time.Minute)},
+			RunnerID: 202, StateSince: time.Now().Add(-time.Minute)},
 	}}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
@@ -391,7 +400,7 @@ func TestReconcile_RunningMissing_DestroysAfterConsecutiveGrace(t *testing.T) {
 
 	mgr := &fakeManager{rows: []pool.RowSnapshot{
 		{VMID: 2004, Name: "gh-runner-test-2004", State: "running",
-			StateSince: time.Now().Add(-time.Minute)},
+			RunnerID: 203, StateSince: time.Now().Add(-time.Minute)},
 	}}
 	r, err := New(baseCfg(), newTestClient(t, srv), mgr, &stubProv{}, silentLogger(), nil)
 	require.NoError(t, err)
@@ -406,6 +415,155 @@ func TestReconcile_RunningMissing_DestroysAfterConsecutiveGrace(t *testing.T) {
 
 	require.Len(t, mgr.destroyCalls, 1)
 	require.Contains(t, mgr.destroyCalls[0].Reason, "missing")
+}
+
+func TestReconcile_RunningUnhealthy_DeletePreflightFailClosed(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		runners  []fakegithub.Runner
+		runnerID int64
+		inject   func(*fakegithub.Server)
+		ghState  string
+	}{
+		{
+			name: "offline active job 422",
+			runners: []fakegithub.Runner{{
+				ID: 210, Name: "gh-runner-test-2010", Status: "offline",
+			}},
+			runnerID: 210,
+			inject: func(fg *fakegithub.Server) {
+				fg.InjectActiveRunnerDeleteRejection(1)
+			},
+			ghState: "offline",
+		},
+		{
+			name:     "missing active job 422",
+			runnerID: 211,
+			inject: func(fg *fakegithub.Server) {
+				fg.InjectActiveRunnerDeleteRejection(1)
+			},
+			ghState: "missing",
+		},
+		{
+			name: "transient delete 500",
+			runners: []fakegithub.Runner{{
+				ID: 212, Name: "gh-runner-test-2010", Status: "offline",
+			}},
+			runnerID: 212,
+			inject: func(fg *fakegithub.Server) {
+				fg.InjectDeleteFailure(http.StatusInternalServerError, 1)
+			},
+			ghState: "offline",
+		},
+		{
+			name: "zero runner ID",
+			runners: []fakegithub.Runner{{
+				ID: 213, Name: "gh-runner-test-2010", Status: "offline",
+			}},
+			ghState: "offline",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fg := fakegithub.New(t, fakegithub.Options{InitialRunners: tc.runners})
+			if tc.inject != nil {
+				tc.inject(fg)
+			}
+			mgr := &fakeManager{rows: []pool.RowSnapshot{{
+				VMID: 2010, Name: "gh-runner-test-2010", State: "running",
+				RunnerID: tc.runnerID, StateSince: time.Now().Add(-time.Hour),
+			}}}
+			metrics := observability.NewMetrics(prometheus.NewRegistry())
+			r, err := New(baseCfg(), newTestClient(t, fg.Server), mgr, &stubProv{}, silentLogger(), metrics)
+			require.NoError(t, err)
+			tickRunningUnhealthyThroughGrace(t, r)
+
+			require.Empty(t, mgr.destroyCalls,
+				"running+%s must survive an inconclusive delete preflight", tc.ghState)
+			require.Equal(t, float64(1),
+				testutil.ToFloat64(metrics.ReconcileErrors.WithLabelValues("test", "protect_running")))
+		})
+	}
+}
+
+func TestReconcile_RunningUnhealthy_DeletePreflightAllowsDestroy(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		runners  []fakegithub.Runner
+		runnerID int64
+	}{
+		{
+			name: "successful delete",
+			runners: []fakegithub.Runner{{
+				ID: 220, Name: "gh-runner-test-2020", Status: "offline",
+			}},
+			runnerID: 220,
+		},
+		{
+			name:     "idempotent not found",
+			runnerID: 221,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fg := fakegithub.New(t, fakegithub.Options{InitialRunners: tc.runners})
+			mgr := &fakeManager{rows: []pool.RowSnapshot{{
+				VMID: 2020, Name: "gh-runner-test-2020", State: "running",
+				RunnerID: tc.runnerID, StateSince: time.Now().Add(-time.Hour),
+			}}}
+			r, err := New(baseCfg(), newTestClient(t, fg.Server), mgr, &stubProv{}, silentLogger(), nil)
+			require.NoError(t, err)
+			tickRunningUnhealthyThroughGrace(t, r)
+
+			require.Len(t, mgr.destroyCalls, 1)
+		})
+	}
+}
+
+func TestReconcile_RunningUnhealthy_HealthyObservationResetsSequence(t *testing.T) {
+	t.Parallel()
+	fg := fakegithub.New(t, fakegithub.Options{InitialRunners: []fakegithub.Runner{{
+		ID: 230, Name: "gh-runner-test-2030", Status: "offline",
+	}}})
+	mgr := &fakeManager{rows: []pool.RowSnapshot{{
+		VMID: 2030, Name: "gh-runner-test-2030", State: "running",
+		RunnerID: 230, StateSince: time.Now().Add(-time.Hour),
+	}}}
+	r, err := New(baseCfg(), newTestClient(t, fg.Server), mgr, &stubProv{}, silentLogger(), nil)
+	require.NoError(t, err)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	for range 7 {
+		require.NoError(t, r.Tick(context.Background()))
+		now = now.Add(20 * time.Second)
+	}
+
+	fg.SetRunner(fakegithub.Runner{
+		ID: 230, Name: "gh-runner-test-2030", Status: "online", Busy: true,
+	})
+	require.NoError(t, r.Tick(context.Background()))
+	fg.SetRunner(fakegithub.Runner{
+		ID: 230, Name: "gh-runner-test-2030", Status: "offline",
+	})
+	now = now.Add(20 * time.Second)
+	require.NoError(t, r.Tick(context.Background()))
+
+	require.Empty(t, mgr.destroyCalls,
+		"a healthy observation must reset both the unhealthy count and grace window")
+}
+
+func tickRunningUnhealthyThroughGrace(t *testing.T, r *Reconciler) {
+	t.Helper()
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	for range 8 {
+		require.NoError(t, r.Tick(context.Background()))
+		now = now.Add(20 * time.Second)
+	}
 }
 
 // 10. hot + busy → promote (sneak-assignment)
@@ -615,14 +773,16 @@ func TestCleanupOrphanRunners_PerCallTimeout(t *testing.T) {
 	// Spin up a GH-API stub that hangs the DELETE forever (until the
 	// reconciler's per-call ctx fires).
 	mux := http.NewServeMux()
-	mux.HandleFunc("/orgs/", func(w http.ResponseWriter, r *http.Request) {
+	hangingDelete := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			<-r.Context().Done()
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"total_count":0,"runners":[]}`))
-	})
+	}
+	mux.HandleFunc("/orgs/", hangingDelete)
+	mux.HandleFunc("/repos/", hangingDelete)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
