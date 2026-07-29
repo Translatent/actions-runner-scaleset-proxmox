@@ -37,7 +37,7 @@ func TestAwaitTask_CloneTaskFailureSurfacesError(t *testing.T) {
 func TestAwaitTask_StartTaskFailureSurfacesError(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{})
-	fp.SeedVM("pve1", 10042, "x", false /* stopped */, nil)
+	fp.SeedVM("pve1", 10042, "x", false /* stopped */, []string{"gh-scaleset", "gh-scaleset-owner-test-scaleset"})
 	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultTaskFails, TaskType: "qmstart"})
 
 	p := newFaultProvisioner(t, fp)
@@ -51,7 +51,7 @@ func TestAwaitTask_DestroyTaskFailureSurfacesError(t *testing.T) {
 	fp := fakeproxmox.New(t, fakeproxmox.Options{})
 	// Seed running so the pre-destroy stop step succeeds and the failure
 	// lands on the qmdestroy task itself.
-	fp.SeedVM("pve1", 10042, "x", true /* running */, nil)
+	fp.SeedVM("pve1", 10042, "x", true /* running */, []string{"gh-scaleset", "gh-scaleset-owner-test-scaleset"})
 	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultTaskFails, TaskType: "qmdestroy"})
 
 	p := newFaultProvisioner(t, fp)

@@ -140,6 +140,10 @@ type Config struct {
 	// contention. Zero falls back to 30s.
 	VMIDReuseCooldown time.Duration
 
+	// StuckRowMaxAge bounds how long a transient store row may be retried.
+	// At the bound it is abandoned and its VMID quarantined.
+	StuckRowMaxAge time.Duration
+
 	// OnRunnerOrphaned is invoked when the manager destroys a VM whose
 	// row had a runner_id set, i.e. a runner that was registered with
 	// GitHub. The callback is expected to deregister the runner. Best
@@ -269,6 +273,7 @@ type manager struct {
 	// the real signal). Only the power-poll goroutine touches this
 	// map, so no synchronisation is needed.
 	powerPollErrLastLog map[int]time.Time
+	now                 func() time.Time
 }
 
 // normaliseProfiles returns the profile slice the manager will
@@ -350,6 +355,9 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 	if cfg.VMIDReuseCooldown <= 0 {
 		cfg.VMIDReuseCooldown = 30 * time.Second
 	}
+	if cfg.StuckRowMaxAge <= 0 {
+		cfg.StuckRowMaxAge = 30 * time.Minute
+	}
 	if log == nil {
 		log = slog.Default()
 	}
@@ -387,6 +395,7 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		profiles:            make(map[string]*profileState, len(cfg.Profiles)),
 		profileOrder:        make([]string, 0, len(cfg.Profiles)),
 		powerPollErrLastLog: make(map[int]time.Time),
+		now:                 time.Now,
 	}
 	for _, p := range cfg.Profiles {
 		ps := &profileState{
@@ -1525,7 +1534,8 @@ func (m *manager) recycleOldVMs(profile string, maxAge time.Duration) {
 // without forcing N concurrent sweeps in multi-profile configs.
 func (m *manager) sweepStuckRows() {
 	const stuckGrace = 5 * time.Minute
-	stuckCutoff := time.Now().Add(-stuckGrace)
+	now := m.now()
+	stuckCutoff := now.Add(-stuckGrace)
 	stuckCandidates, err := m.store.ListByState(
 		store.StateProvisioning, store.StateBooting,
 		store.StateDraining, store.StateDestroying,
@@ -1537,11 +1547,25 @@ func (m *manager) sweepStuckRows() {
 		if !s.UpdatedAt.Before(stuckCutoff) {
 			continue
 		}
+		age := now.Sub(s.UpdatedAt)
+		if age >= m.cfg.StuckRowMaxAge {
+			m.prov.QuarantineVMID(s.VMID)
+			if err := m.store.Delete(s.VMID); err != nil {
+				m.log.Warn("sweep: expired transient row delete failed",
+					"vmid", s.VMID, "node", s.Node, "state", s.State,
+					"age", age, "max_age", m.cfg.StuckRowMaxAge, "err", err)
+				continue
+			}
+			m.log.Warn("sweep: abandoning expired transient row; vmid quarantined",
+				"vmid", s.VMID, "node", s.Node, "state", s.State,
+				"age", age, "max_age", m.cfg.StuckRowMaxAge)
+			continue
+		}
 		m.log.Warn("sweep: row stuck in transient state; re-queueing for destroy",
-			"vmid", s.VMID, "state", s.State, "age", time.Since(s.UpdatedAt))
+			"vmid", s.VMID, "state", s.State, "age", age)
 		if _, err := m.store.Update(s.VMID, func(v *store.VM) {
 			v.State = store.StateDraining
-			v.StateSince = time.Now()
+			v.StateSince = now
 		}); err == nil {
 			m.destroyAsync(s.VMID, s.Node, s.Profile)
 		}
@@ -2151,6 +2175,9 @@ func (m *manager) destroyOrSyncFallback(vmid int, node, profile string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := m.prov.Destroy(ctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
+		if m.abandonOwnershipMismatch(vmid, node, "clone-fail-sync", err) {
+			return
+		}
 		m.log.Warn("clone-fail destroy: synchronous fallback failed; vm may leak", "vmid", vmid, "err", err)
 		return
 	}
@@ -2179,6 +2206,9 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	defer span.End()
 
 	if err := m.prov.Destroy(dctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
+		if m.abandonOwnershipMismatch(vmid, node, "destroy", err) {
+			return
+		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "destroy failed")
 		// Emit a metric so an abandoned destroy is observable. Without
@@ -2246,6 +2276,27 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	}
 }
 
+func (m *manager) abandonOwnershipMismatch(vmid int, node, operation string, err error) bool {
+	if !errors.Is(err, provisioner.ErrOwnershipMismatch) {
+		return false
+	}
+	var mismatch *provisioner.OwnershipMismatchError
+	_ = errors.As(err, &mismatch)
+	if deleteErr := m.store.Delete(vmid); deleteErr != nil {
+		m.log.Warn("destroy: ownership mismatch row delete failed",
+			"vmid", vmid, "node", node, "operation", operation, "err", deleteErr)
+	}
+	if mismatch != nil {
+		m.log.Warn("destroy: refusing foreign VM; abandoning row and retaining quarantine",
+			"vmid", mismatch.VMID, "node", mismatch.Node, "name", mismatch.Name,
+			"tags", mismatch.Tags, "operation", operation)
+	} else {
+		m.log.Warn("destroy: refusing foreign VM; abandoning row and retaining quarantine",
+			"vmid", vmid, "node", node, "operation", operation)
+	}
+	return true
+}
+
 // orphanCleanupTimeout bounds the detached GitHub-deregister call made
 // from destroy(). It must outlive a typical GH API round-trip while
 // still being short enough to not pin process shutdown. Tests may
@@ -2278,6 +2329,9 @@ func (m *manager) allocateVMID(ctx context.Context) (int, error) {
 			continue
 		}
 		if m.prov.IsRecentlyDestroyed(id, m.cfg.VMIDReuseCooldown) {
+			continue
+		}
+		if m.prov.IsVMIDQuarantined(id) {
 			continue
 		}
 		return id, nil

@@ -125,6 +125,14 @@ func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags [
 // fake's state. Tests use it to assert on the orchestrator's effects.
 func (s *Server) Snapshot() []VMSnapshot { return s.store.snapshot() }
 
+// OperationCount reports how many lifecycle calls reached the fake for a
+// VMID. Supported operations are shutdown, stop, and destroy.
+func (s *Server) OperationCount(vmid int, operation string) int {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	return s.store.operations[vmid][operation]
+}
+
 // PowerOff flips a VM's Running flag to false, bypassing the qm stop
 // HTTP path. Used by e2e scenarios that want to model "the in-VM
 // runner finished and powered itself off" without faking a complete
@@ -385,6 +393,12 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.store.mu.Lock()
+	delayFault, delay := s.store.matchFaultLocked(FaultTagApplyDelay, vmid)
+	s.store.mu.Unlock()
+	if delay && delayFault.Duration > 0 {
+		time.Sleep(delayFault.Duration)
+	}
+	s.store.mu.Lock()
 	defer s.store.mu.Unlock()
 	v, ok := s.store.findVMLocked(vmid)
 	if !ok {
@@ -475,6 +489,11 @@ func (s *Server) stopLike(w http.ResponseWriter, r *http.Request, kind string) {
 				chi.URLParam(r, "node"), vmid))
 		return
 	}
+	operation := "stop"
+	if kind == "qmshutdown" {
+		operation = "shutdown"
+	}
+	s.store.recordOperationLocked(vmid, operation)
 	v.Running = false
 	task := s.store.newTaskLocked(v.Node, kind, fmt.Sprintf("%d", vmid))
 	writeData(w, task.UPID)
@@ -504,6 +523,7 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 				chi.URLParam(r, "node"), vmid))
 		return
 	}
+	s.store.recordOperationLocked(vmid, "destroy")
 	delete(s.store.vms, vmid)
 	task := s.store.newTaskLocked(v.Node, "qmdestroy", fmt.Sprintf("%d", vmid))
 	writeData(w, task.UPID)

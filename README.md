@@ -74,6 +74,21 @@ See `quotas:` and `priority:` in [config.example.yaml](config.example.yaml) for 
 
 The source under `internal/...` is the canonical reference for behaviour; package-level doc comments cover each subsystem's contract and design rationale.
 
+## Ownership and destructive-action safety
+
+VMID range membership is defense in depth, not proof that a VM belongs to this
+scaler. Every stop/delete/purge path first reads the current Proxmox VM and
+requires this scale set's live owner tag. The only exemption is a VM whose
+`qmclone` task completed successfully and whose VMID remains precisely tracked
+while owner-tag application is pending; a clone collision never receives that
+exemption.
+
+If the live identity does not match, the scaler performs no lifecycle action,
+abandons the stale in-memory row, logs the VMID/node/name/tags, and quarantines
+the VMID from allocation for the rest of the process lifetime. Transient rows
+are likewise abandoned and quarantined once they reach
+`pool.stuck_row_max_age` (default `30m`) instead of being retried forever.
+
 ## Observability
 
 `observability.http_addr` exposes `/metrics` (Prometheus), `/healthz`, and `/readyz` on every replica. Readiness is leader-aware: standbys are ready as long as Proxmox is reachable within the staleness window (so they can take over); leaders additionally require the scaleset listener to have connected and crash-recovery to have completed.

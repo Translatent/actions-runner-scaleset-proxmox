@@ -200,6 +200,8 @@ func (s *stubProv) Ping(context.Context) error                  { return nil }
 func (s *stubProv) TemplateNode() string                        { return "pve1" }
 func (s *stubProv) Client() *proxmox.Client                     { return nil }
 func (s *stubProv) IsRecentlyDestroyed(int, time.Duration) bool { return false }
+func (s *stubProv) QuarantineVMID(int)                          {}
+func (s *stubProv) IsVMIDQuarantined(int) bool                  { return false }
 func (s *stubProv) InFlightCloneCount() int                     { return 0 }
 
 func silentLogger() *slog.Logger {

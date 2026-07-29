@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -57,7 +58,28 @@ var (
 	// Callers (e.g. scaler.injectWithRetry) should retry with backoff
 	// rather than burning the VM.
 	ErrGuestAgentNotReady = errors.New("provisioner: qemu-guest-agent not ready")
+
+	// ErrOwnershipMismatch means the current VM at a requested VMID does not
+	// carry this scale set's owner tag. Callers must abandon stale state
+	// instead of retrying a destructive operation against that VMID.
+	ErrOwnershipMismatch = errors.New("provisioner: live VM ownership mismatch")
 )
+
+// OwnershipMismatchError records the live Proxmox identity that caused a
+// destructive operation to be refused.
+type OwnershipMismatchError struct {
+	VMID int
+	Node string
+	Name string
+	Tags string
+}
+
+func (e *OwnershipMismatchError) Error() string {
+	return fmt.Sprintf("%v: vmid=%d node=%s name=%q tags=%q",
+		ErrOwnershipMismatch, e.VMID, e.Node, e.Name, e.Tags)
+}
+
+func (e *OwnershipMismatchError) Unwrap() error { return ErrOwnershipMismatch }
 
 // VM is the orchestrator's view of a Proxmox VM. It is intentionally tiny —
 // the persistent store (ent) carries the richer state.
@@ -189,6 +211,8 @@ type Provisioner interface {
 	// otherwise produces "VM N is running - destroy failed" errors
 	// and 60s lock-file timeouts.
 	IsRecentlyDestroyed(vmid int, cooldown time.Duration) bool
+	QuarantineVMID(vmid int)
+	IsVMIDQuarantined(vmid int) bool
 
 	// InFlightCloneCount returns the number of clones currently inside
 	// Clone() between the PVE qmclone task returning and the follow-up
@@ -230,6 +254,10 @@ type pmox struct {
 	// (typically shorter) cooldown. Set via the constructor from
 	// pool.vmid_reuse_cooldown × 4; zero falls back to a 10m default.
 	recentlyDestroyed *ttlcache.Cache[int, time.Time]
+
+	// quarantinedVMIDs contains live ownership mismatches and expired store
+	// rows. It intentionally lasts only for this provisioner process.
+	quarantinedVMIDs sync.Map
 }
 
 // Options configures Provisioner trackers separate from the static
@@ -390,6 +418,15 @@ func (p *pmox) IsRecentlyDestroyed(vmid int, cooldown time.Duration) bool {
 	return true
 }
 
+func (p *pmox) QuarantineVMID(vmid int) {
+	p.quarantinedVMIDs.Store(vmid, struct{}{})
+}
+
+func (p *pmox) IsVMIDQuarantined(vmid int) bool {
+	_, ok := p.quarantinedVMIDs.Load(vmid)
+	return ok
+}
+
 // InFlightCloneCount returns the number of Clone() calls currently in
 // flight. Used by the pool's headroom calculation; see the interface
 // doc for the rationale.
@@ -470,18 +507,14 @@ func isTemplate(vm *proxmox.VirtualMachine) bool {
 // Clone clones the template VM into NewVMID on opts.Node, applies our owner
 // tags, and optionally starts it.
 //
-// While this method is executing, NewVMID is registered in the in-flight
-// clone tracker so [pmox.ListOwnedVMs] suppresses the "untagged orphan"
-// warning that would otherwise fire in the narrow window between PVE's
-// qmclone task returning and the follow-up qmconfig that applies our
-// owner tags. The entry is removed on any return path (success or error).
+// NewVMID enters the in-flight tracker only after qmclone completes
+// successfully. It remains there until owner tags land or cleanup destroys
+// that known-created VM. A clone collision therefore never gains an ownership
+// exemption; the TTL remains a safety net for interrupted cleanup.
 func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if opts.Linked && opts.Node != p.templateNode {
 		return nil, fmt.Errorf("%w: requested node=%s template_node=%s", ErrLinkedCloneCrossNode, opts.Node, p.templateNode)
 	}
-	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
-	defer p.inFlightClones.Delete(opts.NewVMID)
-
 	templateVMID := resolveTemplateVMID(opts.TemplateVMID, p.cfg.TemplateVMID)
 	templateNodeName, err := p.resolveTemplateNode(ctx, opts)
 	if err != nil {
@@ -504,6 +537,7 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if err := awaitTask(ctx, task, 600); err != nil {
 		return nil, fmt.Errorf("await clone task: %w", err)
 	}
+	p.inFlightClones.Set(opts.NewVMID, time.Now(), ttlcache.DefaultTTL)
 
 	// Compute the resulting node; linked clones land on the template node.
 	resultNode := opts.Node
@@ -530,6 +564,9 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if _, err := newVM.Config(ctx, configOpts...); err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
 	}
+	// Owner tags are now the durable proof; the narrow tag-pending exemption
+	// is no longer needed even if a later resize/start step fails.
+	p.inFlightClones.Delete(opts.NewVMID)
 
 	// Disk resize is a distinct API endpoint (not Config). Apply after
 	// the Config call so the override is visible to the resize call.
@@ -706,11 +743,29 @@ func (p *pmox) Stop(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		if isNotFound(err) {
+			p.inFlightClones.Delete(vm.VMID)
 			return nil
 		}
 		return err
 	}
+	if err := p.requireDestructiveOwnership(pVM); err != nil {
+		return err
+	}
 	return p.stopInternal(ctx, pVM)
+}
+
+func (p *pmox) requireDestructiveOwnership(pVM *proxmox.VirtualMachine) error {
+	vmid := int(pVM.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
+	if tags.IsOwnedBy(pVM.Tags, p.scaleSetName) || p.inFlightClones.Has(vmid) {
+		return nil
+	}
+	p.QuarantineVMID(vmid)
+	return &OwnershipMismatchError{
+		VMID: vmid,
+		Node: pVM.Node,
+		Name: pVM.Name,
+		Tags: pVM.Tags,
+	}
 }
 
 // stopInternal does the graceful-then-hard stop with an already-resolved
@@ -751,8 +806,12 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
 		if isNotFound(err) {
+			p.inFlightClones.Delete(vm.VMID)
 			return nil
 		}
+		return err
+	}
+	if err := p.requireDestructiveOwnership(pVM); err != nil {
 		return err
 	}
 	// Reuse the resolved handle for the stop step — Destroy is on the
@@ -763,6 +822,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	task, err := pVM.Delete(ctx)
 	if err != nil {
 		if isNotFound(err) {
+			p.inFlightClones.Delete(vm.VMID)
 			return nil
 		}
 		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
@@ -772,11 +832,13 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		// were tearing it down — common with another orchestrator).
 		classified := classifyProxmoxError(err)
 		if errors.Is(classified, ErrVMNotFound) {
+			p.inFlightClones.Delete(vm.VMID)
 			p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 			return nil
 		}
 		return fmt.Errorf("await delete: %w", classified)
 	}
+	p.inFlightClones.Delete(vm.VMID)
 	// PVE has finished the qmdestroy task. Record the timestamp so the
 	// pool's allocateVMID skips this VMID until the configured cooldown
 	// elapses — without this, a fresh clone targeting the same VMID

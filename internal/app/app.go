@@ -696,6 +696,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
 		TemplateNode:         state.prov.TemplateNode(),
 		VMIDReuseCooldown:    cfg.Pool.VMIDReuseCooldown.D(),
+		StuckRowMaxAge:       cfg.Pool.StuckRowMaxAge.D(),
 		OnRunnerOrphaned: func(ctx context.Context, runnerID int64) error {
 			return removeRunnerIdempotently(ctx, runnerID, ghClient.RemoveRunner)
 		},

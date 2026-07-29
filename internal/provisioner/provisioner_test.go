@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakeproxmox"
 )
 
 // quietLogger discards all log output.
@@ -1079,6 +1080,69 @@ func TestDestroy_TreatsMissingVMAsIdempotent(t *testing.T) {
 	require.NoError(t, err, "a missing VM is idempotent success")
 	require.False(t, p.IsRecentlyDestroyed(10042, time.Hour),
 		"a no-op Destroy must NOT enter the cooldown set")
+}
+
+func TestDestroy_ForeignVMOwnershipMismatchQuarantinesWithoutLifecycleCalls(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10042, "ci-evidence", true, nil)
+	p := newTestProvisioner(t, fp.Server, "pve1")
+
+	err := p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"})
+	require.ErrorIs(t, err, ErrOwnershipMismatch)
+	var mismatch *OwnershipMismatchError
+	require.ErrorAs(t, err, &mismatch)
+	require.Equal(t, "ci-evidence", mismatch.Name)
+	require.True(t, p.IsVMIDQuarantined(10042))
+	require.Equal(t, 0, fp.OperationCount(10042, "shutdown"))
+	require.Equal(t, 0, fp.OperationCount(10042, "stop"))
+	require.Equal(t, 0, fp.OperationCount(10042, "destroy"))
+	snapshot := fp.Snapshot()
+	require.Contains(t, snapshot, fakeproxmox.VMSnapshot{
+		VMID: 10042, Node: "pve1", Name: "ci-evidence", Running: true,
+	})
+}
+
+func TestClone_OccupiedVMIDCreatesNoOwnershipExemption(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{TemplateVMID: 9000, TemplateNode: "pve1"})
+	fp.SeedVM("pve1", 10042, "ci-evidence", true, nil)
+	p := newTestProvisioner(t, fp.Server, "pve1")
+
+	_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10042, Node: "pve1", Name: "runner"})
+	require.Error(t, err)
+	require.False(t, p.inFlightClones.Has(10042),
+		"a failed qmclone collision must never bless the existing occupant")
+
+	err = p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"})
+	require.ErrorIs(t, err, ErrOwnershipMismatch)
+	require.Equal(t, 0, fp.OperationCount(10042, "shutdown"))
+	require.Equal(t, 0, fp.OperationCount(10042, "destroy"))
+}
+
+func TestClone_SuccessfulTagPendingVMRetainsCleanupExemption(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{
+		TemplateVMID: 9000, TemplateNode: "pve1", TaskDuration: time.Millisecond,
+	})
+	fp.InjectFault(fakeproxmox.Fault{
+		Kind: fakeproxmox.FaultTagApplyDelay, VMID: 10043, Duration: 500 * time.Millisecond,
+	})
+	p := newTestProvisioner(t, fp.Server, "pve1")
+	cloneDone := make(chan error, 1)
+	go func() {
+		_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10043, Node: "pve1", Name: "runner"})
+		cloneDone <- err
+	}()
+	require.Eventually(t, func() bool { return p.inFlightClones.Has(10043) },
+		2*time.Second, 10*time.Millisecond)
+
+	err := p.Destroy(context.Background(), &VM{VMID: 10043, Node: "pve1"})
+	require.NoError(t, err, "a qmclone-completed tag-pending VM is known-owned cleanup")
+	require.False(t, p.IsVMIDQuarantined(10043))
+	require.Positive(t, fp.OperationCount(10043, "destroy"))
+	<-cloneDone
+	require.False(t, p.inFlightClones.Has(10043))
 }
 
 // TestListOwnedVMs_PartialNodeFailureReturnsRest: if one node in the

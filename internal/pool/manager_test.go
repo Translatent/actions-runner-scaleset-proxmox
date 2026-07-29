@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,6 +83,7 @@ type fakeProv struct {
 	// consults the set, so toggling membership models "time advanced
 	// past the cooldown."
 	recentlyDestroyedSet map[int]bool
+	quarantinedSet       map[int]bool
 
 	// isRecentlyDestroyedPanic, when true, makes IsRecentlyDestroyed
 	// panic. Used by the allocMu lock-on-panic regression test to
@@ -157,7 +159,13 @@ func (f *fakeProv) Destroy(ctx context.Context, v *provisioner.VM) error {
 		return ctx.Err()
 	}
 	if ok {
+		if errors.Is(specific, provisioner.ErrOwnershipMismatch) {
+			f.QuarantineVMID(v.VMID)
+		}
 		return specific
+	}
+	if errors.Is(f.destroyErr, provisioner.ErrOwnershipMismatch) {
+		f.QuarantineVMID(v.VMID)
 	}
 	return f.destroyErr
 }
@@ -224,6 +232,21 @@ func (f *fakeProv) InFlightCloneCount() int {
 	return f.inFlightClones
 }
 
+func (f *fakeProv) QuarantineVMID(vmid int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.quarantinedSet == nil {
+		f.quarantinedSet = make(map[int]bool)
+	}
+	f.quarantinedSet[vmid] = true
+}
+
+func (f *fakeProv) IsVMIDQuarantined(vmid int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.quarantinedSet[vmid]
+}
+
 // testWriter routes slog output to t.Log.
 type testWriter struct{ t *testing.T }
 
@@ -276,11 +299,7 @@ func newTestManager(t *testing.T, st *store.Store, prov provisioner.Provisioner,
 	require.NoError(t, err)
 
 	metrics := observability.NewMetrics(prometheus.NewRegistry())
-	var w io.Writer
-	w = io.Discard
-	if testing.Verbose() {
-		w = testWriter{t}
-	}
+	w := testLogWriter(t)
 	log := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	mi, err := NewManager(cfg, st, prov, sel, log, metrics)
 	require.NoError(t, err)
@@ -590,6 +609,80 @@ func TestForceDestroy_ConcurrentCallsDedupe(t *testing.T) {
 	defer fp.mu.Unlock()
 	require.Equal(t, 1, len(fp.destroys),
 		"ForceDestroy must dedupe concurrent callers via CAS; saw %d destroys", len(fp.destroys))
+}
+
+func TestForceDestroy_ForeignOwnershipMismatchAbandonsRowAndQuarantines(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedHot(t, st, 1)
+	mismatch := &provisioner.OwnershipMismatchError{
+		VMID: 20000, Node: "pve1", Name: "ci-evidence", Tags: "",
+	}
+	fp := &fakeProv{destroyErrFor: map[int]error{20000: mismatch}}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize:   1,
+		VMIDRange: config.VMIDRange{Min: 20000, Max: 20001},
+	})
+
+	require.NoError(t, mgr.ForceDestroy(context.Background(), 20000, "foreign replacement"))
+	require.Eventually(t, func() bool {
+		_, err := st.Get(20000)
+		return errors.Is(err, store.ErrNotFound)
+	}, time.Second, 10*time.Millisecond)
+	require.True(t, fp.IsVMIDQuarantined(20000))
+
+	id, err := mgr.allocateVMID(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 20001, id, "allocator must skip the quarantined foreign VMID")
+	time.Sleep(50 * time.Millisecond)
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	require.Equal(t, []int{20000}, fp.destroys,
+		"ownership mismatch must abandon the row after one gated provisioner call")
+}
+
+func TestSweepStuckRows_StuckRowMaxAge(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	states := []store.State{
+		store.StateProvisioning, store.StateBooting,
+		store.StateDraining, store.StateDestroying,
+	}
+	st := newTestStore(t)
+	fp := &fakeProv{}
+	mgr := newTestManager(t, st, fp, Config{
+		HotSize: 0, MaxConcurrentRunners: 8,
+		VMIDRange:      config.VMIDRange{Min: 21000, Max: 21010},
+		StuckRowMaxAge: 30 * time.Minute,
+	})
+	mgr.now = func() time.Time { return now }
+	for i, state := range states {
+		require.NoError(t, st.Insert(&store.VM{
+			VMID: 21000 + i, Node: "pve1", Name: "expired",
+			State: state, PoolKind: store.PoolKindHot,
+			UpdatedAt: now.Add(-30 * time.Minute),
+		}))
+	}
+	require.NoError(t, st.Insert(&store.VM{
+		VMID: 21004, Node: "pve1", Name: "young-stuck",
+		State: store.StateProvisioning, PoolKind: store.PoolKindHot,
+		UpdatedAt: now.Add(-10 * time.Minute),
+	}))
+
+	mgr.sweepStuckRows()
+	for i := range states {
+		vmid := 21000 + i
+		_, err := st.Get(vmid)
+		require.ErrorIs(t, err, store.ErrNotFound, "state %s at boundary must expire", states[i])
+		require.True(t, fp.IsVMIDQuarantined(vmid))
+	}
+	require.Eventually(t, func() bool {
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return slices.Contains(fp.destroys, 21004)
+	}, time.Second, 10*time.Millisecond,
+		"row older than stuck grace but younger than max age must requeue")
+	require.False(t, fp.IsVMIDQuarantined(21004))
 }
 
 // TestPromoteN_SaturatedBootSemLeavesRowsWarm locks in the #68 fix:
@@ -1972,6 +2065,10 @@ func (p *panickyProv) TemplateNode() string           { return p.inner.TemplateN
 func (p *panickyProv) Client() *proxmox.Client        { return p.inner.Client() }
 func (p *panickyProv) IsRecentlyDestroyed(vmid int, c time.Duration) bool {
 	return p.inner.IsRecentlyDestroyed(vmid, c)
+}
+func (p *panickyProv) QuarantineVMID(vmid int) { p.inner.QuarantineVMID(vmid) }
+func (p *panickyProv) IsVMIDQuarantined(vmid int) bool {
+	return p.inner.IsVMIDQuarantined(vmid)
 }
 func (p *panickyProv) InFlightCloneCount() int { return p.inner.InFlightCloneCount() }
 
