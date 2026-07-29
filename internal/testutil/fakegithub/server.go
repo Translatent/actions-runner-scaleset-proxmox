@@ -391,7 +391,11 @@ func (s *Server) routes() http.Handler {
 		// Injectable deregister failure (#327): drive the destroy
 		// path's OnRunnerOrphaned failure branch.
 		if f, ok := s.takeDeleteFaultLocked(); ok {
-			writeGitHubError(w, f.status, "runner deregistration failed")
+			message := f.message
+			if message == "" {
+				message = "runner deregistration failed"
+			}
+			writeGitHubError(w, f.status, message)
 			return
 		}
 		if _, ok := s.runners[id]; !ok {

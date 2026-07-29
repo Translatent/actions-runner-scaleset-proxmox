@@ -395,6 +395,7 @@ pool: {}
 	require.Equal(t, 30*time.Second, cfg.Pool.VMIDReuseCooldown.D())
 	require.Equal(t, 60*time.Second, cfg.Pool.OrphanGrace.D())
 	require.Equal(t, 5*time.Minute, cfg.Pool.CloneInflightGrace.D())
+	require.Equal(t, 30*time.Minute, cfg.Pool.StuckRowMaxAge.D())
 }
 
 // TestPool_RaceGraceKnobs_AcceptOverrides confirms the three pool grace
@@ -419,6 +420,7 @@ pool:
   vmid_reuse_cooldown: 45s
   orphan_grace: 90s
   clone_inflight_grace: 10m
+  stuck_row_max_age: 45m
 `
 	setEnv(t, map[string]string{"TEST_GH_TOKEN": "x", "TEST_PVE_TOKEN": "y"})
 	cfg, err := config.Parse([]byte(yaml))
@@ -426,6 +428,7 @@ pool:
 	require.Equal(t, 45*time.Second, cfg.Pool.VMIDReuseCooldown.D())
 	require.Equal(t, 90*time.Second, cfg.Pool.OrphanGrace.D())
 	require.Equal(t, 10*time.Minute, cfg.Pool.CloneInflightGrace.D())
+	require.Equal(t, 45*time.Minute, cfg.Pool.StuckRowMaxAge.D())
 }
 
 // TestPool_RaceGraceKnobs_RejectZeroOrNegative locks down the
@@ -440,9 +443,11 @@ func TestPool_RaceGraceKnobs_RejectZeroOrNegative(t *testing.T) {
 		{"vmid_reuse_cooldown zero", "vmid_reuse_cooldown", "0s"},
 		{"orphan_grace zero", "orphan_grace", "0s"},
 		{"clone_inflight_grace zero", "clone_inflight_grace", "0s"},
+		{"stuck_row_max_age zero", "stuck_row_max_age", "0s"},
 		{"vmid_reuse_cooldown negative", "vmid_reuse_cooldown", "-1s"},
 		{"orphan_grace negative", "orphan_grace", "-1s"},
 		{"clone_inflight_grace negative", "clone_inflight_grace", "-1s"},
+		{"stuck_row_max_age negative", "stuck_row_max_age", "-1s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			yaml := `
@@ -2364,6 +2369,7 @@ func TestParse_ExplicitZeroPoolDurationsRejected(t *testing.T) {
 		"vmid_reuse_cooldown":  "pool.vmid_reuse_cooldown must be positive",
 		"orphan_grace":         "pool.orphan_grace must be positive",
 		"clone_inflight_grace": "pool.clone_inflight_grace must be positive",
+		"stuck_row_max_age":    "pool.stuck_row_max_age must be positive",
 	} {
 		t.Run(field, func(t *testing.T) {
 			bad := strings.Replace(validPATYAML,

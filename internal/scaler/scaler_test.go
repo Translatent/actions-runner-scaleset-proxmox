@@ -204,6 +204,8 @@ func (stubProvForScaler) Ping(context.Context) error                  { return n
 func (stubProvForScaler) TemplateNode() string                        { return "pve1" }
 func (stubProvForScaler) Client() *proxmox.Client                     { return nil }
 func (stubProvForScaler) IsRecentlyDestroyed(int, time.Duration) bool { return false }
+func (stubProvForScaler) QuarantineVMID(int)                          {}
+func (stubProvForScaler) IsVMIDQuarantined(int) bool                  { return false }
 func (stubProvForScaler) InFlightCloneCount() int                     { return 0 }
 
 func itoa(n int) string {

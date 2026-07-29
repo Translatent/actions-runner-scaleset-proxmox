@@ -213,6 +213,9 @@ pool:
   # Entries older than this are pruned by a background sweep in case
   # Clone hangs and never returns to clear them.
   clone_inflight_grace: 5m
+  # Abandon and quarantine transient rows at this age instead of retrying
+  # destruction forever against a potentially reused VMID.
+  stuck_row_max_age: 30m
 
 # Optional runner profiles — a named bundle of {labels, template,
 # hardware shape, per-profile pool sizing}. Each profile gets its

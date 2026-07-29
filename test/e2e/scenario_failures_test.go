@@ -78,6 +78,51 @@ func TestE2E_DestroyIdempotentOnVMNotFound(t *testing.T) {
 		"VMNotFound-on-destroy must classify as idempotent success, not trigger a failed-clone replacement (saw %v)", cloneFailed)
 }
 
+func TestE2E_ForeignVMIDSubstitutionIsUntouchedAndQuarantined(t *testing.T) {
+	t.Parallel()
+	h := Start(t, Options{HotSize: 1, MaxConcurrentRunners: 2})
+	var targetVMID int
+	require.Eventually(t, func() bool {
+		for _, vm := range h.Proxmox.Snapshot() {
+			if vm.VMID >= 10000 && vm.VMID <= 10999 && vm.Running {
+				targetVMID = vm.VMID
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond, "tracked owner-tagged hot VM never appeared")
+
+	// Model human VMID reuse while the scaler still has the old in-memory row.
+	h.Proxmox.SeedVM("pve1", targetVMID, "ci-evidence-fixture", true, nil)
+	resp := h.AdminRequest(t, "POST", "/admin/destroy/"+itoa(targetVMID), nil)
+	resp.Body.Close()
+	require.Equal(t, 202, resp.StatusCode)
+
+	// Two+ reconcile intervals: the stale row is abandoned, the fixture is
+	// never touched, and refill allocates a different VMID.
+	time.Sleep(500 * time.Millisecond)
+	require.Equal(t, 0, h.Proxmox.OperationCount(targetVMID, "shutdown"))
+	require.Equal(t, 0, h.Proxmox.OperationCount(targetVMID, "stop"))
+	require.Equal(t, 0, h.Proxmox.OperationCount(targetVMID, "destroy"))
+	var fixturePresent bool
+	for _, vm := range h.Proxmox.Snapshot() {
+		if vm.VMID == targetVMID {
+			fixturePresent = vm.Name == "ci-evidence-fixture" && vm.Running && vm.Tags == ""
+		}
+	}
+	require.True(t, fixturePresent, "foreign fixture must remain present and running")
+	require.Eventually(t, func() bool {
+		for _, vm := range h.Proxmox.Snapshot() {
+			if vm.VMID >= 10000 && vm.VMID <= 10999 && vm.VMID != targetVMID &&
+				vm.Running && vm.Tags != "" {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond,
+		"replacement allocation must skip the quarantined VMID")
+}
+
 // TestE2E_GuestAgentTransientRetry asserts the orchestrator retries
 // past a transient "guest agent not responding" window during VM boot,
 // matching the real-world startup race where qemu-guest-agent is
