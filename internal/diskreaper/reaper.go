@@ -161,6 +161,7 @@ func (r *Reaper) Sweep(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	r.initializeBaseline(candidates, guestConfigs, replications, now)
+	r.releaseReusedBaseline(guestConfigs)
 	if err := saveState(r.cfg.StateFile, r.state); err != nil {
 		return Result{}, fmt.Errorf("persist observations: %w", err)
 	}
@@ -380,6 +381,31 @@ func (r *Reaper) initializeBaseline(candidates []Candidate, guests, replications
 		}
 	}
 	r.state.Initialized = true
+}
+
+// releaseReusedBaseline ends cutover protection once a VMID has entered a new
+// guest lifecycle. Proxmox routinely reuses vm-<id>-disk-<n> names after an
+// owned VM is destroyed; retaining the old name forever would cause a later
+// orphan with the same name to be mistaken for cutover residue. While the
+// config exists the ordinary guest-config gate prevents deletion. After it is
+// destroyed, any remaining matching volume belongs to the new lifecycle and
+// follows the normal observation threshold.
+func (r *Reaper) releaseReusedBaseline(guests map[int]struct{}) {
+	for key := range r.state.PreservedInitial {
+		match := diskVolumeRE.FindStringSubmatch(key)
+		if match == nil {
+			continue
+		}
+		var vmid int
+		if _, err := fmt.Sscanf(match[1], "%d", &vmid); err != nil {
+			continue
+		}
+		if _, configured := guests[vmid]; configured {
+			delete(r.state.PreservedInitial, key)
+			r.log.Info("disk reaper: released cutover baseline for reused vmid",
+				"vmid", vmid, "dataset_key", key)
+		}
+	}
 }
 
 func candidateKey(candidate Candidate) string { return candidate.Node + "\x00" + candidate.Dataset }

@@ -1,6 +1,8 @@
 package diskreaper
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -84,4 +86,29 @@ func TestInitializeBaselinePreservesOnlyInitialEligibleSet(t *testing.T) {
 	r.initializeBaseline([]Candidate{later}, map[int]struct{}{}, map[int]struct{}{}, now.Add(time.Hour))
 	require.NotContains(t, r.state.PreservedInitial, candidateKey(later),
 		"a later orphan must remain automatic after state initialization")
+}
+
+func TestReleaseReusedBaselineMakesLaterSameNameAutomatic(t *testing.T) {
+	now := time.Now()
+	reused := Candidate{VMID: 905, Node: "pve2", Dataset: "vmdata:vm-905-disk-0", CreatedAt: now.Add(-2 * time.Hour)}
+	other := Candidate{VMID: 906, Node: "pve2", Dataset: "vmdata:vm-906-disk-0", CreatedAt: now.Add(-2 * time.Hour)}
+	r := &Reaper{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		state: &persistedState{PreservedInitial: map[string]struct{}{
+			candidateKey(reused): {},
+			candidateKey(other):  {},
+		}},
+	}
+
+	r.releaseReusedBaseline(map[int]struct{}{905: {}})
+
+	require.NotContains(t, r.state.PreservedInitial, candidateKey(reused))
+	require.Contains(t, r.state.PreservedInitial, candidateKey(other))
+	decision := Evaluate(reused, Inventory{
+		Ranges: []config.VMIDRange{{Min: 900, Max: 999}}, GuestConfigs: map[int]struct{}{},
+		ReplicationJobs: map[int]struct{}{}, Now: now, MinimumAge: time.Hour,
+		PreservedInitial: r.state.PreservedInitial,
+	})
+	require.True(t, decision.Eligible,
+		"a later orphan reusing the same volume name must not inherit cutover protection")
 }
