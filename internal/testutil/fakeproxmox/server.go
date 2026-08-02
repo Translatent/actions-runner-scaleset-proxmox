@@ -133,6 +133,18 @@ func (s *Server) OperationCount(vmid int, operation string) int {
 	return s.store.operations[vmid][operation]
 }
 
+// DestroyQuery returns the query parameters received by the most recent
+// DELETE for vmid. The copy prevents tests from mutating fake server state.
+func (s *Server) DestroyQuery(vmid int) map[string][]string {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	out := make(map[string][]string, len(s.store.destroyQuery[vmid]))
+	for key, values := range s.store.destroyQuery[vmid] {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
 // PowerOff flips a VM's Running flag to false, bypassing the qm stop
 // HTTP path. Used by e2e scenarios that want to model "the in-VM
 // runner finished and powered itself off" without faking a complete
@@ -507,6 +519,10 @@ func (s *Server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.mu.Lock()
 	defer s.store.mu.Unlock()
+	if s.store.destroyQuery == nil {
+		s.store.destroyQuery = make(map[int]map[string][]string)
+	}
+	s.store.destroyQuery[vmid] = r.URL.Query()
 	if _, ok := s.store.matchFaultLocked(FaultVMNotFoundOnDestroy, vmid); ok {
 		// Simulate "operator already deleted the VM out-of-band": the
 		// orchestrator's destroy path must classify this as

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -819,7 +820,21 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	if err := p.stopInternal(ctx, pVM); err != nil {
 		p.log.Warn("stop before destroy failed; proceeding to delete anyway", "vmid", vm.VMID, "err", err)
 	}
-	task, err := pVM.Delete(ctx)
+	// go-proxmox's VirtualMachine.Delete first removes the optional custom
+	// cloud-init ISO created by VirtualMachine.CloudInit. Calling the raw
+	// endpoint below would otherwise skip that cleanup. The scaleset does not
+	// create those ISOs today, but preserving the library behaviour here keeps
+	// a future CloudInit caller from trading the disk leak for an ISO leak.
+	if err := p.deleteCloudInitISO(ctx, pVM); err != nil {
+		return fmt.Errorf("delete cloud-init iso: %w", classifyProxmoxError(err))
+	}
+
+	params := url.Values{}
+	params.Set("destroy-unreferenced-disks", "1")
+	params.Set("purge", "1")
+	path := fmt.Sprintf("/nodes/%s/qemu/%d?%s", pVM.Node, pVM.VMID, params.Encode())
+	var upid proxmox.UPID
+	err = p.cli.Delete(ctx, path, &upid)
 	if err != nil {
 		if isNotFound(err) {
 			p.inFlightClones.Delete(vm.VMID)
@@ -827,6 +842,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		}
 		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
 	}
+	task := proxmox.NewTask(upid, p.cli)
 	if err := awaitTask(ctx, task, 120); err != nil {
 		// Mid-task 404 → idempotent success (VM disappeared while we
 		// were tearing it down — common with another orchestrator).
@@ -845,6 +861,42 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	// would race PVE-side lock-file cleanup and produce
 	// "VM N is running - destroy failed" errors.
 	p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
+	return nil
+}
+
+// deleteCloudInitISO mirrors go-proxmox VirtualMachine.Delete's private
+// pre-delete helper. The library tags only its custom user-data ISO flow with
+// "proxmox-cloud-init"; Proxmox's ordinary built-in cloud-init drive does not
+// use this path.
+func (p *pmox) deleteCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine) error {
+	if !vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		return nil
+	}
+
+	node, err := p.cli.Node(ctx, vm.Node)
+	if err != nil {
+		return err
+	}
+	storages, err := node.Storages(ctx)
+	if err != nil {
+		return err
+	}
+
+	isoFilename := fmt.Sprintf(proxmox.UserDataISOFormat, vm.VMID)
+	for _, storage := range storages {
+		if storage.Enabled == 0 || !strings.Contains(storage.Content, "iso") {
+			continue
+		}
+		iso, isoErr := storage.ISO(ctx, isoFilename)
+		if isoErr != nil {
+			continue
+		}
+		task, deleteErr := iso.Delete(ctx)
+		if deleteErr != nil {
+			return deleteErr
+		}
+		return task.WaitFor(ctx, 5)
+	}
 	return nil
 }
 

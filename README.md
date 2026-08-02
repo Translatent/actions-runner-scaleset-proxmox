@@ -16,6 +16,20 @@ A second control loop — the **GitHub REST reconciler** — periodically lists 
 
 State lives in-process in [hashicorp/go-memdb](https://github.com/hashicorp/go-memdb) — no on-disk DB, no migrations. On startup the orchestrator reconciles its empty view against Proxmox by listing VMs tagged as owned by this scale set; any leftovers from a previous process are destroyed.
 
+The leader also runs a fail-closed orphan-disk sweep. It considers only image
+volumes whose VMID is inside a currently configured scale-set range, has no
+QEMU or LXC config anywhere in the cluster, has no replication job, and has
+been continuously observed for at least `pool.disk_reaper_min_age` (one hour by
+default). The observations can be persisted with
+`pool.disk_reaper_state_file`, which is important for ZFS because PVE does not
+expose image-volume creation time through its content API. Every deletion is
+revalidated immediately before the storage call. To inspect the same decision
+set without deleting, run:
+
+```sh
+scaleset reap-orphan-disks --config /etc/scaleset/config.yaml --dry-run
+```
+
 Proxmox node placement is pluggable via `nodes.strategy`: **`single`** (always the same node, for single-node PVE), **`round_robin`** (rotate through a configured member list), or **`least_loaded`** (periodically polls `/cluster/resources` and picks the node with the lowest weighted CPU + memory load).
 
 An optional `nodes.affinity:` block layers profile-keyed rules over the chosen strategy: pin a profile to specific nodes with `prefer_nodes: [...]` (combine with `require: true` for a hard pin that fails the clone when no preferred node is eligible), and keep two profiles off the same node with `anti_affinity_with: { profile: ... }`. Rules apply before the underlying strategy picks among the surviving candidates so rotation / load balancing keep their semantics within the eligible set. Hard-pin failures surface as `nodeselector.ErrAffinityRequireUnsatisfiable`. Config validation rejects rules that name an undeclared profile or node — typos surface at load time rather than as silent no-ops at runtime.

@@ -29,6 +29,7 @@ import (
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/canary"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/cluster"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/diskreaper"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/gh"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/ipam"
@@ -70,6 +71,49 @@ type Options struct {
 	// point the orchestrator at fake GitHub servers without minting
 	// real credentials.
 	AuthOverride githubauth.Auth
+}
+
+// ReapOrphanDisksOptions configures the bounded CLI dry-run entrypoint.
+type ReapOrphanDisksOptions struct {
+	ConfigPath string
+	DryRun     bool
+}
+
+// ReapOrphanDisks performs one inventory sweep. Manual invocation is
+// intentionally dry-run-only; destructive sweeping belongs to the leader's
+// periodic control loop, where the complete configured VMID range set is
+// already authoritative.
+func ReapOrphanDisks(ctx context.Context, opts ReapOrphanDisksOptions) (diskreaper.Result, error) {
+	if !opts.DryRun {
+		return diskreaper.Result{}, errors.New("reap orphan disks: --dry-run is required")
+	}
+	cfg, err := config.Load(opts.ConfigPath)
+	if err != nil {
+		return diskreaper.Result{}, err
+	}
+	log, err := observability.NewLogger(cfg.Observability.LogLevel, cfg.Observability.LogFormat)
+	if err != nil {
+		return diskreaper.Result{}, err
+	}
+	first := cfg.Scalesets[0]
+	prov, err := provisioner.New(ctx, cfg.Proxmox, first.Name,
+		fmt.Sprintf("gh-runner-%s-", first.Name), provisioner.Options{}, log)
+	if err != nil {
+		return diskreaper.Result{}, fmt.Errorf("init provisioner: %w", err)
+	}
+	ranges := make([]config.VMIDRange, 0, len(cfg.Scalesets))
+	for _, entry := range cfg.Scalesets {
+		ranges = append(ranges, entryVMIDRange(entry, cfg.Proxmox.VMIDRange))
+	}
+	reaper, err := diskreaper.New(prov.Client(), diskreaper.Config{
+		Storage: cfg.Proxmox.Storage.Disk, Ranges: ranges,
+		Interval: cfg.Pool.DiskReaperInterval.D(), MinimumAge: cfg.Pool.DiskReaperMinAge.D(),
+		StateFile: cfg.Pool.DiskReaperStateFile, DryRun: true,
+	}, log)
+	if err != nil {
+		return diskreaper.Result{}, err
+	}
+	return reaper.Sweep(ctx)
 }
 
 // Run executes the orchestrator until ctx is cancelled or an unrecoverable
@@ -180,6 +224,19 @@ func Run(ctx context.Context, opts Options) error {
 	// happens via ctx cancel on process-wide SIGTERM / drain.
 	runLeaderPlane := func(leaderCtx context.Context) error {
 		g, ctxg := errgroup.WithContext(leaderCtx)
+		ranges := make([]config.VMIDRange, 0, len(cfg.Scalesets))
+		for _, entry := range cfg.Scalesets {
+			ranges = append(ranges, entryVMIDRange(entry, cfg.Proxmox.VMIDRange))
+		}
+		reaper, err := diskreaper.New(sharedProv.Client(), diskreaper.Config{
+			Storage: cfg.Proxmox.Storage.Disk, Ranges: ranges,
+			Interval: cfg.Pool.DiskReaperInterval.D(), MinimumAge: cfg.Pool.DiskReaperMinAge.D(),
+			StateFile: cfg.Pool.DiskReaperStateFile,
+		}, log)
+		if err != nil {
+			return fmt.Errorf("init disk reaper: %w", err)
+		}
+		g.Go(func() error { return runSwallowCancel(func() error { return reaper.Run(ctxg) }) })
 		for i := range cfg.Scalesets {
 			entry := cfg.Scalesets[i]
 			state := scStates[entry.Name]

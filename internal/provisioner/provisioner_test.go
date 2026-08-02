@@ -1103,6 +1103,19 @@ func TestDestroy_ForeignVMOwnershipMismatchQuarantinesWithoutLifecycleCalls(t *t
 	})
 }
 
+func TestDestroy_PurgesUnreferencedDisks(t *testing.T) {
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10042, "gh-runner-test-scaleset-10042", false,
+		[]string{"gh-scaleset", "gh-scaleset-owner-test-scaleset"})
+	p := newTestProvisioner(t, fp.Server, "pve1")
+	p.vmNamePrefix = "gh-runner-test-scaleset-"
+	p.scaleSetName = "test-scaleset"
+
+	require.NoError(t, p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"}))
+	require.Equal(t, []string{"1"}, fp.DestroyQuery(10042)["destroy-unreferenced-disks"])
+	require.Equal(t, []string{"1"}, fp.DestroyQuery(10042)["purge"])
+}
+
 func TestClone_OccupiedVMIDCreatesNoOwnershipExemption(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{TemplateVMID: 9000, TemplateNode: "pve1"})

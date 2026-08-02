@@ -39,14 +39,15 @@ type taskRecord struct {
 // intended for single-process tests; a single lock keeps the
 // implementation honest about race conditions in the orchestrator.
 type store struct {
-	mu         sync.Mutex
-	vms        map[int]*vmRecord // keyed by vmid
-	tasks      map[string]*taskRecord
-	nextTask   uint64
-	taskDur    time.Duration
-	agentWait  time.Duration
-	faults     []Fault
-	operations map[int]map[string]int
+	mu           sync.Mutex
+	vms          map[int]*vmRecord // keyed by vmid
+	tasks        map[string]*taskRecord
+	nextTask     uint64
+	taskDur      time.Duration
+	agentWait    time.Duration
+	faults       []Fault
+	operations   map[int]map[string]int
+	destroyQuery map[int]map[string][]string
 }
 
 func (s *store) recordOperationLocked(vmid int, operation string) {

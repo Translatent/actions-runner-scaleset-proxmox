@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -54,7 +55,26 @@ func main() {
 		},
 	}
 
-	root.AddCommand(runCmd, versionCmd)
+	var reaperDryRun bool
+	reaperCmd := &cobra.Command{
+		Use:   "reap-orphan-disks",
+		Short: "List orphan runner disks eligible for the periodic reaper.",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer cancel()
+			result, err := app.ReapOrphanDisks(ctx, app.ReapOrphanDisksOptions{
+				ConfigPath: configPath, DryRun: reaperDryRun,
+			})
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(result)
+		},
+	}
+	reaperCmd.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config YAML.")
+	reaperCmd.Flags().BoolVar(&reaperDryRun, "dry-run", false, "List eligible disks without deleting them (required).")
+
+	root.AddCommand(runCmd, versionCmd, reaperCmd)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "scaleset: %v\n", err)

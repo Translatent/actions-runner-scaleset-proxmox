@@ -571,6 +571,15 @@ type PoolConfig struct {
 	// it is abandoned and its VMID quarantined. Default "30m"; must be > 0.
 	StuckRowMaxAge Duration `yaml:"stuck_row_max_age"`
 
+	// DiskReaperInterval is the maximum time between orphan-volume sweeps.
+	// DiskReaperMinAge is the continuous observed age required before an
+	// otherwise-unreferenced disk can be deleted. DiskReaperStateFile persists
+	// first observations for storage backends (including ZFS) whose PVE content
+	// response does not expose ctime.
+	DiskReaperInterval  Duration `yaml:"disk_reaper_interval"`
+	DiskReaperMinAge    Duration `yaml:"disk_reaper_min_age"`
+	DiskReaperStateFile string   `yaml:"disk_reaper_state_file"`
+
 	// Schedules is the default schedule set inherited by the
 	// synthesised "default" profile when no profiles: block is
 	// declared. Operators that declare profiles set schedules
@@ -1227,6 +1236,8 @@ func (c *Config) ApplyDefaults() {
 	c.Pool.OrphanGrace.setDefault(60 * time.Second)
 	c.Pool.CloneInflightGrace.setDefault(5 * time.Minute)
 	c.Pool.StuckRowMaxAge.setDefault(30 * time.Minute)
+	c.Pool.DiskReaperInterval.setDefault(15 * time.Minute)
+	c.Pool.DiskReaperMinAge.setDefault(time.Hour)
 	// Observability
 	if c.Observability.HTTPAddr == "" {
 		c.Observability.HTTPAddr = ":9100"
@@ -1437,6 +1448,12 @@ func (c *Config) Resolve() error {
 	}
 	if c.Pool.StuckRowMaxAge.D() <= 0 {
 		return errors.New("pool.stuck_row_max_age must be positive")
+	}
+	if c.Pool.DiskReaperInterval.D() <= 0 {
+		return errors.New("pool.disk_reaper_interval must be positive")
+	}
+	if c.Pool.DiskReaperMinAge.D() <= 0 {
+		return errors.New("pool.disk_reaper_min_age must be positive")
 	}
 	if c.GitHub.RunningOfflineGrace.D() <= 0 {
 		return errors.New("github.running_offline_grace must be positive")

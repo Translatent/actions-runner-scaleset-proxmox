@@ -1,0 +1,53 @@
+package diskreaper
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/config"
+)
+
+func TestEvaluateFourConditions(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	base := Inventory{
+		Ranges:       []config.VMIDRange{{Min: 900, Max: 999}},
+		GuestConfigs: map[int]struct{}{}, ReplicationJobs: map[int]struct{}{},
+		Now: now, MinimumAge: time.Hour,
+	}
+	oldLeak := Candidate{VMID: 905, Dataset: "vmdata:vm-905-disk-0", CreatedAt: now.Add(-2 * time.Hour)}
+	require.True(t, Evaluate(oldLeak, base).Eligible, "a genuine leak must be accepted")
+
+	tests := []struct {
+		name      string
+		candidate Candidate
+		mutate    func(*Inventory)
+	}{
+		{name: "outside configured range", candidate: Candidate{VMID: 100, Dataset: "vmdata:vm-100-disk-0", CreatedAt: oldLeak.CreatedAt}},
+		{name: "guest config on another node", candidate: oldLeak, mutate: func(i *Inventory) { i.GuestConfigs[905] = struct{}{} }},
+		{name: "replication job", candidate: oldLeak, mutate: func(i *Inventory) { i.ReplicationJobs[905] = struct{}{} }},
+		{name: "younger than threshold", candidate: Candidate{VMID: 905, Dataset: oldLeak.Dataset, CreatedAt: now.Add(-59 * time.Minute)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := Inventory{Ranges: append([]config.VMIDRange(nil), base.Ranges...),
+				GuestConfigs: map[int]struct{}{}, ReplicationJobs: map[int]struct{}{},
+				Now: base.Now, MinimumAge: base.MinimumAge}
+			if tc.mutate != nil {
+				tc.mutate(&inv)
+			}
+			require.False(t, Evaluate(tc.candidate, inv).Eligible)
+		})
+	}
+}
+
+func TestEvaluateUnknownAgeFailsClosed(t *testing.T) {
+	d := Evaluate(Candidate{VMID: 905}, Inventory{
+		Ranges:       []config.VMIDRange{{Min: 900, Max: 999}},
+		GuestConfigs: map[int]struct{}{}, ReplicationJobs: map[int]struct{}{},
+		Now: time.Now(), MinimumAge: time.Hour,
+	})
+	require.False(t, d.OldEnough)
+	require.False(t, d.Eligible)
+}
