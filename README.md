@@ -26,6 +26,10 @@ expose image-volume creation time through its content API. Every deletion is
 revalidated immediately before the storage call. To inspect the same decision
 set without deleting, run:
 
+`pool.disk_reaper_preserve_initial` retains the eligible set present when a
+new state file is initialized. This creates an explicit review boundary for
+old residue while disks first observed after initialization remain automatic.
+
 ```sh
 scaleset reap-orphan-disks --config /etc/scaleset/config.yaml --dry-run
 ```

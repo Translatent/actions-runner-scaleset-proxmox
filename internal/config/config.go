@@ -579,6 +579,9 @@ type PoolConfig struct {
 	DiskReaperInterval  Duration `yaml:"disk_reaper_interval"`
 	DiskReaperMinAge    Duration `yaml:"disk_reaper_min_age"`
 	DiskReaperStateFile string   `yaml:"disk_reaper_state_file"`
+	// DiskReaperPreserveInitial records the eligible orphan set seen when a
+	// fresh state file is initialized but never deletes that cutover baseline.
+	DiskReaperPreserveInitial bool `yaml:"disk_reaper_preserve_initial"`
 
 	// Schedules is the default schedule set inherited by the
 	// synthesised "default" profile when no profiles: block is

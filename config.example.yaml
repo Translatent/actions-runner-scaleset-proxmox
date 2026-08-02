@@ -214,6 +214,7 @@ pool:
   disk_reaper_interval: 15m
   disk_reaper_min_age: 1h
   disk_reaper_state_file: /var/lib/scaleset/orphan-disk-observations.json
+  disk_reaper_preserve_initial: true
 
   # TTL safety net for the Provisioner's in-flight clone tracker.
   # Entries older than this are pruned by a background sweep in case

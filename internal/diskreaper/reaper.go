@@ -34,21 +34,24 @@ type Candidate struct {
 
 // Inventory is the complete safety input used to evaluate a candidate.
 type Inventory struct {
-	Ranges          []config.VMIDRange
-	GuestConfigs    map[int]struct{}
-	ReplicationJobs map[int]struct{}
-	Now             time.Time
-	MinimumAge      time.Duration
+	Ranges           []config.VMIDRange
+	GuestConfigs     map[int]struct{}
+	ReplicationJobs  map[int]struct{}
+	Now              time.Time
+	MinimumAge       time.Duration
+	PreservedInitial map[string]struct{}
 }
 
-// Decision records all four load-bearing conditions. Eligible is true only
-// when every condition is true.
+// Decision records all four load-bearing conditions plus the explicit
+// cutover-baseline exclusion. Eligible is true only when every condition is
+// true and the dataset is not in that preserved initial set.
 type Decision struct {
 	Candidate            Candidate
 	InConfiguredRange    bool
 	GuestConfigAbsent    bool
 	ReplicationJobAbsent bool
 	OldEnough            bool
+	PreservedInitial     bool
 	Age                  time.Duration
 	Eligible             bool
 }
@@ -70,7 +73,8 @@ func Evaluate(candidate Candidate, inventory Inventory) Decision {
 		d.Age = inventory.Now.Sub(candidate.CreatedAt)
 		d.OldEnough = d.Age >= inventory.MinimumAge
 	}
-	d.Eligible = d.InConfiguredRange && d.GuestConfigAbsent && d.ReplicationJobAbsent && d.OldEnough
+	_, d.PreservedInitial = inventory.PreservedInitial[candidateKey(candidate)]
+	d.Eligible = d.InConfiguredRange && d.GuestConfigAbsent && d.ReplicationJobAbsent && d.OldEnough && !d.PreservedInitial
 	return d
 }
 
@@ -79,27 +83,30 @@ func Evaluate(candidate Candidate, inventory Inventory) Decision {
 // PVE ZFS image content). Seeing the same volume after MinimumAge proves the
 // dataset itself is at least that old without guessing from its name.
 type Config struct {
-	Storage    string
-	Ranges     []config.VMIDRange
-	Interval   time.Duration
-	MinimumAge time.Duration
-	StateFile  string
-	DryRun     bool
-	Now        func() time.Time
+	Storage         string
+	Ranges          []config.VMIDRange
+	Interval        time.Duration
+	MinimumAge      time.Duration
+	StateFile       string
+	DryRun          bool
+	PreserveInitial bool
+	ReportPreserved bool
+	Now             func() time.Time
 }
 
 // Result is the stable output of one sweep.
 type Result struct {
-	Decisions []Decision
-	Eligible  []Decision
+	Decisions  []Decision
+	Eligible   []Decision
+	Reportable []Decision
 }
 
 // Reaper inventories through the PVE API and deletes only evaluated volumes.
 type Reaper struct {
-	client       *proxmox.Client
-	cfg          Config
-	log          *slog.Logger
-	observations map[string]time.Time
+	client *proxmox.Client
+	cfg    Config
+	log    *slog.Logger
+	state  *persistedState
 }
 
 // New validates and constructs a Reaper.
@@ -149,31 +156,39 @@ func (r *Reaper) sweepAndLog(ctx context.Context) {
 // Sweep performs one complete inventory/evaluate/delete cycle.
 func (r *Reaper) Sweep(ctx context.Context) (Result, error) {
 	now := r.cfg.Now()
-	guestConfigs, replications, candidates, observations, err := r.inventory(ctx, now)
+	guestConfigs, replications, candidates, err := r.inventory(ctx, now)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := saveObservations(r.cfg.StateFile, observations); err != nil {
+	r.initializeBaseline(candidates, guestConfigs, replications, now)
+	if err := saveState(r.cfg.StateFile, r.state); err != nil {
 		return Result{}, fmt.Errorf("persist observations: %w", err)
 	}
 
 	inv := Inventory{
 		Ranges: r.cfg.Ranges, GuestConfigs: guestConfigs, ReplicationJobs: replications,
-		Now: now, MinimumAge: r.cfg.MinimumAge,
+		Now: now, MinimumAge: r.cfg.MinimumAge, PreservedInitial: r.state.PreservedInitial,
 	}
 	result := Result{Decisions: make([]Decision, 0, len(candidates))}
 	for _, candidate := range candidates {
 		decision := Evaluate(candidate, inv)
 		result.Decisions = append(result.Decisions, decision)
-		if !decision.Eligible {
+		reportPreserved := r.cfg.DryRun && r.cfg.ReportPreserved && decision.PreservedInitial &&
+			decision.InConfiguredRange && decision.GuestConfigAbsent &&
+			decision.ReplicationJobAbsent && decision.OldEnough
+		if !decision.Eligible && !reportPreserved {
 			continue
 		}
-		result.Eligible = append(result.Eligible, decision)
-		r.log.Warn("disk reaper: eligible orphan disk", "dry_run", r.cfg.DryRun,
+		result.Reportable = append(result.Reportable, decision)
+		if decision.Eligible {
+			result.Eligible = append(result.Eligible, decision)
+		}
+		r.log.Warn("disk reaper: orphan disk report", "dry_run", r.cfg.DryRun,
 			"vmid", candidate.VMID, "dataset", candidate.Dataset, "node", candidate.Node,
 			"age", decision.Age, "in_configured_range", decision.InConfiguredRange,
 			"guest_config_absent", decision.GuestConfigAbsent,
-			"replication_job_absent", decision.ReplicationJobAbsent, "old_enough", decision.OldEnough)
+			"replication_job_absent", decision.ReplicationJobAbsent, "old_enough", decision.OldEnough,
+			"preserved_initial", decision.PreservedInitial)
 		if r.cfg.DryRun {
 			continue
 		}
@@ -234,14 +249,14 @@ func (r *Reaper) revalidateReferences(ctx context.Context, vmid int) error {
 	return nil
 }
 
-func (r *Reaper) inventory(ctx context.Context, now time.Time) (map[int]struct{}, map[int]struct{}, []Candidate, map[string]time.Time, error) {
+func (r *Reaper) inventory(ctx context.Context, now time.Time) (map[int]struct{}, map[int]struct{}, []Candidate, error) {
 	cluster, err := r.client.Cluster(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("cluster: %w", err)
+		return nil, nil, nil, fmt.Errorf("cluster: %w", err)
 	}
 	resources, err := cluster.Resources(ctx, "vm")
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("list all guest configs: %w", err)
+		return nil, nil, nil, fmt.Errorf("list all guest configs: %w", err)
 	}
 	guests := make(map[int]struct{}, len(resources))
 	for _, resource := range resources {
@@ -251,7 +266,7 @@ func (r *Reaper) inventory(ctx context.Context, now time.Time) (map[int]struct{}
 	}
 	jobs, err := cluster.ReplicationJobs(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("list replication jobs: %w", err)
+		return nil, nil, nil, fmt.Errorf("list replication jobs: %w", err)
 	}
 	replications := make(map[int]struct{}, len(jobs))
 	for _, job := range jobs {
@@ -267,34 +282,34 @@ func (r *Reaper) inventory(ctx context.Context, now time.Time) (map[int]struct{}
 		}
 	}
 
-	if r.observations == nil {
-		r.observations, err = loadObservations(r.cfg.StateFile)
+	if r.state == nil {
+		r.state, err = loadState(r.cfg.StateFile)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
-	observations := r.observations
+	observations := r.state.Observations
 	nodes, err := r.client.Nodes(ctx)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("list nodes: %w", err)
+		return nil, nil, nil, fmt.Errorf("list nodes: %w", err)
 	}
 	var candidates []Candidate
 	seen := make(map[string]struct{})
 	for _, nodeStatus := range nodes {
 		node, nodeErr := r.client.Node(ctx, nodeStatus.Node)
 		if nodeErr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("node %s: %w", nodeStatus.Node, nodeErr)
+			return nil, nil, nil, fmt.Errorf("node %s: %w", nodeStatus.Node, nodeErr)
 		}
 		storage, storageErr := node.Storage(ctx, r.cfg.Storage)
 		if storageErr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("storage %s on %s: %w", r.cfg.Storage, nodeStatus.Node, storageErr)
+			return nil, nil, nil, fmt.Errorf("storage %s on %s: %w", r.cfg.Storage, nodeStatus.Node, storageErr)
 		}
 		if storage.Enabled == 0 || storage.Active == 0 {
 			continue
 		}
 		contents, contentErr := storage.GetContent(ctx)
 		if contentErr != nil {
-			return nil, nil, nil, nil, fmt.Errorf("content %s on %s: %w", r.cfg.Storage, nodeStatus.Node, contentErr)
+			return nil, nil, nil, fmt.Errorf("content %s on %s: %w", r.cfg.Storage, nodeStatus.Node, contentErr)
 		}
 		r.log.Debug("disk reaper: storage inventory", "node", nodeStatus.Node,
 			"storage", r.cfg.Storage, "volumes", len(contents))
@@ -334,7 +349,7 @@ func (r *Reaper) inventory(ctx context.Context, now time.Time) (map[int]struct{}
 		}
 		return candidates[i].Dataset < candidates[j].Dataset
 	})
-	return guests, replications, candidates, observations, nil
+	return guests, replications, candidates, nil
 }
 
 func checkedVMID(value uint64) (int, bool) {
@@ -344,8 +359,35 @@ func checkedVMID(value uint64) (int, bool) {
 	return int(value), true // #nosec G115 -- range checked above
 }
 
-func loadObservations(path string) (map[string]time.Time, error) {
-	out := make(map[string]time.Time)
+type persistedState struct {
+	Initialized      bool                 `json:"initialized"`
+	Observations     map[string]time.Time `json:"observations"`
+	PreservedInitial map[string]struct{}  `json:"preservedInitial,omitempty"`
+}
+
+func (r *Reaper) initializeBaseline(candidates []Candidate, guests, replications map[int]struct{}, now time.Time) {
+	if r.state.Initialized {
+		return
+	}
+	if r.cfg.PreserveInitial {
+		inv := Inventory{Ranges: r.cfg.Ranges, GuestConfigs: guests, ReplicationJobs: replications,
+			Now: now, MinimumAge: 0, PreservedInitial: map[string]struct{}{}}
+		for _, candidate := range candidates {
+			decision := Evaluate(candidate, inv)
+			if decision.InConfiguredRange && decision.GuestConfigAbsent && decision.ReplicationJobAbsent {
+				r.state.PreservedInitial[candidateKey(candidate)] = struct{}{}
+			}
+		}
+	}
+	r.state.Initialized = true
+}
+
+func candidateKey(candidate Candidate) string { return candidate.Node + "\x00" + candidate.Dataset }
+
+func loadState(path string) (*persistedState, error) {
+	out := &persistedState{
+		Observations: make(map[string]time.Time), PreservedInitial: make(map[string]struct{}),
+	}
 	if path == "" {
 		return out, nil
 	}
@@ -357,20 +399,26 @@ func loadObservations(path string) (map[string]time.Time, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read observation state: %w", err)
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := json.Unmarshal(raw, out); err != nil {
 		return nil, fmt.Errorf("decode observation state: %w", err)
+	}
+	if out.Observations == nil {
+		out.Observations = make(map[string]time.Time)
+	}
+	if out.PreservedInitial == nil {
+		out.PreservedInitial = make(map[string]struct{})
 	}
 	return out, nil
 }
 
-func saveObservations(path string, observations map[string]time.Time) error {
+func saveState(path string, state *persistedState) error {
 	if path == "" {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	raw, err := json.Marshal(observations)
+	raw, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}

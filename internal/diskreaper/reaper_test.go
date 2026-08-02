@@ -51,3 +51,37 @@ func TestEvaluateUnknownAgeFailsClosed(t *testing.T) {
 	require.False(t, d.OldEnough)
 	require.False(t, d.Eligible)
 }
+
+func TestEvaluatePreservedInitialRefusesDeletion(t *testing.T) {
+	now := time.Now()
+	candidate := Candidate{VMID: 905, Node: "pve2", Dataset: "vmdata:vm-905-disk-0", CreatedAt: now.Add(-2 * time.Hour)}
+	d := Evaluate(candidate, Inventory{
+		Ranges: []config.VMIDRange{{Min: 900, Max: 999}}, GuestConfigs: map[int]struct{}{},
+		ReplicationJobs: map[int]struct{}{}, Now: now, MinimumAge: time.Hour,
+		PreservedInitial: map[string]struct{}{candidateKey(candidate): {}},
+	})
+	require.True(t, d.InConfiguredRange)
+	require.True(t, d.GuestConfigAbsent)
+	require.True(t, d.ReplicationJobAbsent)
+	require.True(t, d.OldEnough)
+	require.True(t, d.PreservedInitial)
+	require.False(t, d.Eligible)
+}
+
+func TestInitializeBaselinePreservesOnlyInitialEligibleSet(t *testing.T) {
+	now := time.Now()
+	r := &Reaper{
+		cfg:   Config{PreserveInitial: true, Ranges: []config.VMIDRange{{Min: 900, Max: 999}}},
+		state: &persistedState{Observations: map[string]time.Time{}, PreservedInitial: map[string]struct{}{}},
+	}
+	initial := Candidate{VMID: 905, Node: "pve2", Dataset: "vmdata:vm-905-disk-0", CreatedAt: now}
+	configured := Candidate{VMID: 906, Node: "pve2", Dataset: "vmdata:vm-906-disk-0", CreatedAt: now}
+	r.initializeBaseline([]Candidate{initial, configured}, map[int]struct{}{906: {}}, map[int]struct{}{}, now)
+	require.Contains(t, r.state.PreservedInitial, candidateKey(initial))
+	require.NotContains(t, r.state.PreservedInitial, candidateKey(configured))
+
+	later := Candidate{VMID: 907, Node: "pve2", Dataset: "vmdata:vm-907-disk-0", CreatedAt: now}
+	r.initializeBaseline([]Candidate{later}, map[int]struct{}{}, map[int]struct{}{}, now.Add(time.Hour))
+	require.NotContains(t, r.state.PreservedInitial, candidateKey(later),
+		"a later orphan must remain automatic after state initialization")
+}

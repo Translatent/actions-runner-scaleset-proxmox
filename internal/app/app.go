@@ -108,7 +108,8 @@ func ReapOrphanDisks(ctx context.Context, opts ReapOrphanDisksOptions) (diskreap
 	reaper, err := diskreaper.New(prov.Client(), diskreaper.Config{
 		Storage: cfg.Proxmox.Storage.Disk, Ranges: ranges,
 		Interval: cfg.Pool.DiskReaperInterval.D(), MinimumAge: cfg.Pool.DiskReaperMinAge.D(),
-		StateFile: cfg.Pool.DiskReaperStateFile, DryRun: true,
+		StateFile: cfg.Pool.DiskReaperStateFile, PreserveInitial: cfg.Pool.DiskReaperPreserveInitial,
+		DryRun: true, ReportPreserved: true,
 	}, log)
 	if err != nil {
 		return diskreaper.Result{}, err
@@ -231,7 +232,8 @@ func Run(ctx context.Context, opts Options) error {
 		reaper, err := diskreaper.New(sharedProv.Client(), diskreaper.Config{
 			Storage: cfg.Proxmox.Storage.Disk, Ranges: ranges,
 			Interval: cfg.Pool.DiskReaperInterval.D(), MinimumAge: cfg.Pool.DiskReaperMinAge.D(),
-			StateFile: cfg.Pool.DiskReaperStateFile,
+			StateFile:       cfg.Pool.DiskReaperStateFile,
+			PreserveInitial: cfg.Pool.DiskReaperPreserveInitial,
 		}, log)
 		if err != nil {
 			return fmt.Errorf("init disk reaper: %w", err)
