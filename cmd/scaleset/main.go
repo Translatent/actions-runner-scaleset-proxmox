@@ -68,7 +68,7 @@ func main() {
 			if err != nil {
 				return err
 			}
-			return json.NewEncoder(os.Stdout).Encode(result)
+			return json.NewEncoder(os.Stdout).Encode(result.Eligible)
 		},
 	}
 	reaperCmd.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config YAML.")
