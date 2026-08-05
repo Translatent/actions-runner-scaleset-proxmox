@@ -40,6 +40,24 @@ func (s *Server) InjectDeleteFailure(status, count int) {
 	s.deleteFault = httpFault{status: status, count: count}
 }
 
+// InjectGenerateJITFailure makes the next count generatejitconfig calls fail
+// with status. HTTP 401 uses GitHub Actions' InvalidTokenException envelope;
+// the fault is concurrency-safe and isolated to this endpoint.
+func (s *Server) InjectGenerateJITFailure(status, count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.generateJITFault = httpFault{status: status, count: count}
+}
+
+func (s *Server) takeGenerateJITFaultLocked() (httpFault, bool) {
+	if s.generateJITFault.count <= 0 {
+		return httpFault{}, false
+	}
+	f := s.generateJITFault
+	s.generateJITFault.count--
+	return f, true
+}
+
 // InjectActiveRunnerDeleteRejection makes the next count runner-DELETE
 // calls return GitHub's active-job rejection. Reconciler tests use this
 // as the authoritative proof that a Running VM must be retained.

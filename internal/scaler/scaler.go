@@ -56,11 +56,17 @@ type Config struct {
 // Scaler implements scaleset.Scaler against the orchestrator's pool.
 type Scaler struct {
 	cfg     Config
-	gh      *scaleset.Client
 	pool    pool.Manager
 	prov    provisioner.Provisioner
 	log     *slog.Logger
 	metrics *observability.Metrics
+
+	// clientMu serializes snapshots and compare-and-refresh of the
+	// Actions-service admin client. The listener owns a separate session
+	// client and is deliberately unaffected by this pointer.
+	clientMu      sync.Mutex
+	gh            *scaleset.Client
+	clientFactory func(context.Context) (*scaleset.Client, error)
 
 	// router maps a job's RequestLabels to the profile the scaler
 	// would ideally serve it from. Nil disables routing entirely —
@@ -111,8 +117,52 @@ func New(cfg Config, gh *scaleset.Client, p pool.Manager, prov provisioner.Provi
 		cfg.WorkFolder = "_work"
 	}
 	s := &Scaler{cfg: cfg, gh: gh, pool: p, prov: prov, log: log, metrics: metrics}
+	if metrics != nil && cfg.ScaleSetName != "" {
+		// Pre-create the closed outcome series so /metrics exports both
+		// before the first refresh incident.
+		metrics.JITTokenRefresh.WithLabelValues(cfg.ScaleSetName, "success").Add(0)
+		metrics.JITTokenRefresh.WithLabelValues(cfg.ScaleSetName, "failure").Add(0)
+	}
 	s.provisionOneFn = s.provisionOne
 	return s
+}
+
+// SetClientFactory installs the constructor used to replace a rejected
+// Actions-service admin client. Callers wire it once during construction,
+// before the scaler is exposed to the listener.
+func (s *Scaler) SetClientFactory(factory func(context.Context) (*scaleset.Client, error)) {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	s.clientFactory = factory
+}
+
+func (s *Scaler) clientSnapshot() *scaleset.Client {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	return s.gh
+}
+
+// compareAndRefreshClient replaces failed only when it is still active. A
+// concurrent caller that already published a replacement wins; later callers
+// reuse that pointer instead of constructing another client.
+func (s *Scaler) compareAndRefreshClient(ctx context.Context, failed *scaleset.Client) (*scaleset.Client, bool, error) {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	if s.gh != failed {
+		return s.gh, false, nil
+	}
+	if s.clientFactory == nil {
+		return nil, false, errors.New("scaleset admin client factory is not configured")
+	}
+	fresh, err := s.clientFactory(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if fresh == nil {
+		return nil, false, errors.New("scaleset admin client factory returned nil")
+	}
+	s.gh = fresh
+	return fresh, true, nil
 }
 
 // SetRouter attaches a label router. Pass nil to disable routing
@@ -459,20 +509,50 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	// registrations and every subsequent GenerateJitRunnerConfig call
 	// returns 409 "runner already exists", permanently breaking the pool.
 	s.cleanupStaleRunnerByName(vmObj.Name) //nolint:contextcheck // deliberately detached; see function comment
+	return s.provisionJIT(ctx, vmObj, s.clientSnapshot())
+}
 
-	jitCfg, err := s.gh.GenerateJitRunnerConfig(ctx, &scaleset.RunnerScaleSetJitRunnerSetting{
+// provisionJIT performs one mint/inject attempt using the supplied client
+// snapshot. Keeping the snapshot explicit is load-bearing for
+// compare-and-refresh: a 401 must compare the exact pointer whose request
+// failed, even if another goroutine publishes a replacement meanwhile.
+func (s *Scaler) provisionJIT(ctx context.Context, vmObj *pool.VM, failedClient *scaleset.Client) bool {
+	setting := &scaleset.RunnerScaleSetJitRunnerSetting{
 		Name:       vmObj.Name,
 		WorkFolder: s.cfg.WorkFolder,
-	}, s.cfg.ScaleSetID)
+	}
+	jitCfg, err := failedClient.GenerateJitRunnerConfig(ctx, setting, s.cfg.ScaleSetID)
 	if err != nil {
-		s.log.Error("jit config generation failed; releasing vm", "vmid", vmObj.VMID, "err", err)
 		if s.metrics != nil {
 			s.metrics.GitHubErrors.WithLabelValues(s.cfg.ScaleSetName, "generate_jit").Inc()
 		}
-		if mcErr := s.pool.MarkCompleted(ctx, vmObj.VMID); mcErr != nil {
-			s.log.Warn("mark completed failed after jit generation error", "vmid", vmObj.VMID, "err", mcErr)
+		if strings.Contains(err.Error(), `status="401 Unauthorized"`) {
+			var published bool
+			var refreshErr error
+			failedClient, published, refreshErr = s.compareAndRefreshClient(ctx, failedClient)
+			if refreshErr != nil {
+				s.log.Error("jit admin client refresh failed; releasing vm", "vmid", vmObj.VMID, "err", refreshErr)
+				if s.metrics != nil {
+					s.metrics.JITTokenRefresh.WithLabelValues(s.cfg.ScaleSetName, "failure").Inc()
+				}
+				return s.releaseAfterJITFailure(ctx, vmObj.VMID)
+			}
+			jitCfg, err = failedClient.GenerateJitRunnerConfig(ctx, setting, s.cfg.ScaleSetID)
+			if err == nil {
+				if published && s.metrics != nil {
+					s.metrics.JITTokenRefresh.WithLabelValues(s.cfg.ScaleSetName, "success").Inc()
+				}
+			} else {
+				s.log.Error("jit config generation failed after one admin client refresh; releasing vm", "vmid", vmObj.VMID, "err", err)
+				if published && s.metrics != nil {
+					s.metrics.JITTokenRefresh.WithLabelValues(s.cfg.ScaleSetName, "failure").Inc()
+				}
+				return s.releaseAfterJITFailure(ctx, vmObj.VMID)
+			}
+		} else {
+			s.log.Error("jit config generation failed; releasing vm", "vmid", vmObj.VMID, "err", err)
+			return s.releaseAfterJITFailure(ctx, vmObj.VMID)
 		}
-		return false
 	}
 
 	var runnerID int64
@@ -518,6 +598,13 @@ func (s *Scaler) provisionOne(ctx context.Context, vmObj *pool.VM) bool {
 	return true
 }
 
+func (s *Scaler) releaseAfterJITFailure(ctx context.Context, vmid int) bool {
+	if mcErr := s.pool.MarkCompleted(ctx, vmid); mcErr != nil {
+		s.log.Warn("mark completed failed after jit generation error", "vmid", vmid, "err", mcErr)
+	}
+	return false
+}
+
 // cleanupStaleRunnerByName best-effort removes a runner registration
 // matching the given name. Used both before generating a new JIT (to
 // avoid 409 conflicts) and after a failed inject (to avoid leaking).
@@ -535,7 +622,8 @@ func (s *Scaler) cleanupStaleRunnerByName(name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), staleRunnerCleanupTimeout)
 	defer cancel()
 
-	existing, err := s.gh.GetRunnerByName(ctx, name)
+	client := s.clientSnapshot()
+	existing, err := client.GetRunnerByName(ctx, name)
 	if err != nil {
 		if s.metrics != nil {
 			s.metrics.GitHubErrors.WithLabelValues(s.cfg.ScaleSetName, "get_runner_by_name").Inc()
@@ -547,7 +635,7 @@ func (s *Scaler) cleanupStaleRunnerByName(name string) {
 		// "not found" is the common case.
 		return
 	}
-	if err := s.gh.RemoveRunner(ctx, int64(existing.ID)); err != nil {
+	if err := client.RemoveRunner(ctx, int64(existing.ID)); err != nil {
 		if s.metrics != nil {
 			s.metrics.GitHubErrors.WithLabelValues(s.cfg.ScaleSetName, "remove_stale_runner").Inc()
 		}

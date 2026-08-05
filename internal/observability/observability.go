@@ -85,6 +85,7 @@ type Metrics struct {
 	AcquireDuration      *prometheus.HistogramVec
 	ProxmoxErrors        *prometheus.CounterVec
 	GitHubErrors         *prometheus.CounterVec
+	JITTokenRefresh      *prometheus.CounterVec
 	ListenerMessages     *prometheus.CounterVec
 	ReconcileDuration    *prometheus.HistogramVec
 	AtCapacityTotal      *prometheus.CounterVec
@@ -243,6 +244,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "github_api_errors_total",
 			Help: "Errors from GitHub API calls.",
 		}, []string{"scaleset", "endpoint"}),
+		JITTokenRefresh: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "jit_token_refresh_total",
+			Help: "Terminal outcomes of Actions admin-client refreshes after JIT HTTP 401 responses.",
+		}, []string{"scaleset", "outcome"}),
 		ListenerMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "listener_messages_total",
 			Help: "Inbound listener messages by kind.",
@@ -323,7 +328,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.PoolSize, m.VMsTotal, m.CloneDuration, m.BootDuration,
-		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors,
+		m.AcquireDuration, m.ProxmoxErrors, m.GitHubErrors, m.JITTokenRefresh,
 		m.ListenerMessages, m.ReconcileDuration, m.AtCapacityTotal,
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
 		m.ReconcileErrors, m.UnroutedJobs,
