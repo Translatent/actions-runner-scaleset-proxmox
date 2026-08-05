@@ -17,12 +17,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/githubauth"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/observability"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/pool"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/priority"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/provisioner"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/quotas"
 	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/router"
+	"github.com/jeffresc/actions-runner-scaleset-proxmox/internal/testutil/fakegithub"
 )
 
 func TestVMIDFromRunnerName(t *testing.T) {
@@ -208,6 +210,25 @@ func (stubProvForScaler) QuarantineVMID(int)                          {}
 func (stubProvForScaler) IsVMIDQuarantined(int) bool                  { return false }
 func (stubProvForScaler) InFlightCloneCount() int                     { return 0 }
 
+type recordingProv struct {
+	stubProvForScaler
+	mu       sync.Mutex
+	injected []string
+}
+
+func (p *recordingProv) InjectJITConfig(_ context.Context, _ *provisioner.VM, jit string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.injected = append(p.injected, jit)
+	return nil
+}
+
+func (p *recordingProv) injectCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.injected)
+}
+
 func itoa(n int) string {
 	// Small dependency-free implementation to keep this file standalone.
 	if n == 0 {
@@ -229,6 +250,176 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+func clientForFakeGitHub(t *testing.T, srv *fakegithub.Server, opts ...scaleset.HTTPOption) *scaleset.Client {
+	t.Helper()
+	auth, err := githubauth.NewPATWithConfig(githubauth.PATConfig{
+		Token:       "ghp_fake",
+		ConfigURL:   srv.ConfigURL("octocat"),
+		RESTBaseURL: srv.RESTBaseURL(),
+	})
+	require.NoError(t, err)
+	client, err := auth.NewScaleSetClient(t.Context(), githubauth.Scope{Org: "octocat"}, scaleset.SystemInfo{
+		System: "scaler-test", Version: "test", CommitSHA: "test", ScaleSetID: srv.ScaleSetID(), Subsystem: "controller",
+	}, opts...)
+	require.NoError(t, err)
+	return client
+}
+
+func refreshTestScaler(t *testing.T, initial *scaleset.Client, factory func(context.Context) (*scaleset.Client, error)) (*Scaler, *fakePool, *recordingProv, *observability.Metrics) {
+	t.Helper()
+	fp := &fakePool{}
+	prov := &recordingProv{}
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	log := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	s := New(Config{ScaleSetID: 42, ScaleSetName: "test-scaleset", WorkFolder: "_work", NamePrefix: "gh-runner-test-"}, initial, fp, prov, log, metrics)
+	s.SetClientFactory(factory)
+	return s, fp, prov, metrics
+}
+
+func TestProvisionJIT_UnauthorizedRefreshesAndRetriesIdenticalRequest(t *testing.T) {
+	oldServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	freshServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	oldServer.InjectGenerateJITFailure(401, 1)
+	oldClient := clientForFakeGitHub(t, oldServer)
+	freshClient := clientForFakeGitHub(t, freshServer)
+	var factoryCalls atomic.Int32
+	s, fp, prov, metrics := refreshTestScaler(t, oldClient, func(context.Context) (*scaleset.Client, error) {
+		factoryCalls.Add(1)
+		return freshClient, nil
+	})
+	vm := &pool.VM{VMID: 10042, Node: "pve1", Name: "gh-runner-test-10042"}
+
+	require.True(t, s.provisionJIT(t.Context(), vm, oldClient))
+	require.Equal(t, int32(1), factoryCalls.Load())
+	require.Equal(t, []fakegithub.JITAttempt{{Name: vm.Name, WorkFolder: "_work"}}, oldServer.JITAttempts())
+	require.Equal(t, oldServer.JITAttempts(), freshServer.JITAttempts(), "retry body must be identical")
+	require.Equal(t, 0, oldServer.JITMintCount())
+	require.Equal(t, 1, freshServer.JITMintCount())
+	require.Equal(t, 1, prov.injectCount())
+	require.Empty(t, fp.markedCompleted)
+	require.Equal(t, 1.0, counterValue(t, metrics.GitHubErrors, "test-scaleset", "generate_jit"))
+	require.Equal(t, 1.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "success"))
+	require.Equal(t, 0.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "failure"))
+}
+
+func TestProvisionJIT_ConcurrentStaleFailuresPublishOneReplacement(t *testing.T) {
+	const runners = 16
+	oldServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	freshServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	oldServer.InjectGenerateJITFailure(401, runners)
+	oldClient := clientForFakeGitHub(t, oldServer)
+	freshClient := clientForFakeGitHub(t, freshServer)
+	var factoryCalls atomic.Int32
+	s, fp, prov, metrics := refreshTestScaler(t, oldClient, func(context.Context) (*scaleset.Client, error) {
+		factoryCalls.Add(1)
+		return freshClient, nil
+	})
+
+	var wg sync.WaitGroup
+	results := make(chan bool, runners)
+	for i := range runners {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			vmid := 11000 + i
+			results <- s.provisionJIT(t.Context(), &pool.VM{
+				VMID: vmid, Node: "pve1", Name: fmt.Sprintf("gh-runner-test-%d", vmid),
+			}, oldClient)
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	for delivered := range results {
+		require.True(t, delivered)
+	}
+	require.Equal(t, int32(1), factoryCalls.Load(), "stale-client burst must construct one replacement")
+	require.Equal(t, runners, oldServer.JITAttemptCount())
+	require.Equal(t, runners, freshServer.JITAttemptCount())
+	require.Equal(t, runners, freshServer.JITMintCount())
+	require.Equal(t, runners, prov.injectCount())
+	require.Empty(t, fp.markedCompleted)
+	require.Equal(t, float64(runners), counterValue(t, metrics.GitHubErrors, "test-scaleset", "generate_jit"))
+	require.Equal(t, 1.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "success"))
+	require.Equal(t, 0.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "failure"))
+}
+
+func TestProvisionJIT_NonUnauthorizedDoesNotRefreshAndReleasesVM(t *testing.T) {
+	server := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	server.InjectGenerateJITFailure(500, 2)
+	client := clientForFakeGitHub(t, server, scaleset.WithRetryMax(1))
+	var factoryCalls atomic.Int32
+	s, fp, prov, metrics := refreshTestScaler(t, client, func(context.Context) (*scaleset.Client, error) {
+		factoryCalls.Add(1)
+		return client, nil
+	})
+
+	require.False(t, s.provisionJIT(t.Context(), &pool.VM{VMID: 10043, Node: "pve1", Name: "gh-runner-test-10043"}, client))
+	require.Zero(t, factoryCalls.Load())
+	require.Equal(t, []int{10043}, fp.markedCompleted)
+	require.Zero(t, prov.injectCount())
+	require.Equal(t, 1.0, counterValue(t, metrics.GitHubErrors, "test-scaleset", "generate_jit"))
+	require.Equal(t, 0.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "success"))
+	require.Equal(t, 0.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "failure"))
+}
+
+func TestProvisionJIT_RefreshFailuresAreBoundedAndReleaseVM(t *testing.T) {
+	t.Run("factory failure", func(t *testing.T) {
+		server := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+		server.InjectGenerateJITFailure(401, 1)
+		client := clientForFakeGitHub(t, server)
+		var factoryCalls atomic.Int32
+		s, fp, prov, metrics := refreshTestScaler(t, client, func(context.Context) (*scaleset.Client, error) {
+			factoryCalls.Add(1)
+			return nil, errors.New("mint replacement token")
+		})
+		require.False(t, s.provisionJIT(t.Context(), &pool.VM{VMID: 10044, Node: "pve1", Name: "gh-runner-test-10044"}, client))
+		require.Equal(t, int32(1), factoryCalls.Load())
+		require.Equal(t, 1, server.JITAttemptCount())
+		require.Equal(t, []int{10044}, fp.markedCompleted)
+		require.Zero(t, prov.injectCount())
+		require.Equal(t, 1.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "failure"))
+	})
+
+	t.Run("single retry also unauthorized", func(t *testing.T) {
+		oldServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+		freshServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+		oldServer.InjectGenerateJITFailure(401, 1)
+		freshServer.InjectGenerateJITFailure(401, 1)
+		oldClient := clientForFakeGitHub(t, oldServer)
+		freshClient := clientForFakeGitHub(t, freshServer)
+		var factoryCalls atomic.Int32
+		s, fp, prov, metrics := refreshTestScaler(t, oldClient, func(context.Context) (*scaleset.Client, error) {
+			factoryCalls.Add(1)
+			return freshClient, nil
+		})
+		require.False(t, s.provisionJIT(t.Context(), &pool.VM{VMID: 10045, Node: "pve1", Name: "gh-runner-test-10045"}, oldClient))
+		require.Equal(t, int32(1), factoryCalls.Load())
+		require.Equal(t, 1, oldServer.JITAttemptCount())
+		require.Equal(t, 1, freshServer.JITAttemptCount())
+		require.Equal(t, []int{10045}, fp.markedCompleted)
+		require.Zero(t, prov.injectCount())
+		require.Equal(t, 1.0, counterValue(t, metrics.JITTokenRefresh, "test-scaleset", "failure"))
+		require.Equal(t, 1.0, counterValue(t, metrics.GitHubErrors, "test-scaleset", "generate_jit"), "only the original endpoint failure retains the existing error increment")
+	})
+}
+
+func TestCleanupStaleRunnerUsesPostRotationClient(t *testing.T) {
+	oldServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	freshServer := fakegithub.New(t, fakegithub.Options{ScaleSet: fakegithub.ScaleSetOptions{Name: "test-scaleset", ID: 42}})
+	oldClient := clientForFakeGitHub(t, oldServer)
+	freshClient := clientForFakeGitHub(t, freshServer)
+	s, _, _, _ := refreshTestScaler(t, oldClient, func(context.Context) (*scaleset.Client, error) { return freshClient, nil })
+	rotated, published, err := s.compareAndRefreshClient(t.Context(), oldClient)
+	require.NoError(t, err)
+	require.True(t, published)
+	require.Same(t, freshClient, rotated)
+	freshServer.SetRunner(fakegithub.Runner{ID: 777, Name: "gh-runner-test-10777", Status: "offline"})
+
+	s.cleanupStaleRunnerByName("gh-runner-test-10777")
+	require.Empty(t, oldServer.RunnerDeletions())
+	require.Equal(t, []int64{777}, freshServer.RunnerDeletions())
 }
 
 // quietScaler builds a Scaler with a fake pool and a stub provisionOne

@@ -780,6 +780,14 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		WorkFolder:   "_work",
 		NamePrefix:   state.vmPrefix,
 	}, ghClient, mgr, state.prov, log, metrics)
+	sc.SetClientFactory(func(ctx context.Context) (*scaleset.Client, error) {
+		fresh, err := auth.NewScaleSetClient(ctx, scope, ssSysInfo)
+		if err != nil {
+			return nil, err
+		}
+		fresh.SetSystemInfo(ssSysInfo)
+		return fresh, nil
+	})
 
 	if r, err := routerForScaleset(entry); err != nil {
 		log.Warn("router: build failed; routing observations disabled", "scaleset", entry.Name, "err", err)

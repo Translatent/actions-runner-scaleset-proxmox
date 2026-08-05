@@ -103,6 +103,10 @@ type Server struct {
 	// decrements count.
 	deleteFault httpFault
 
+	// generateJITFault is isolated to the Actions-service JIT endpoint.
+	// It does not affect registration, message-session, or REST auth.
+	generateJITFault httpFault
+
 	// scalesets is the per-scaleset state, indexed by scaleset name
 	// (the operator-facing identifier). scalesetsByID is a parallel
 	// view for routing handlers that key off the URL {id} param.
@@ -124,6 +128,7 @@ type scalesetEntry struct {
 	session      *sessionState
 	statistics   fakeRunnerScaleSetStatistic
 	jitMintCount int
+	jitAttempts  []JITAttempt
 	// jitMintsByName maps the runner name passed to
 	// GenerateJitRunnerConfig to the synthesised runner ID handed
 	// back. Concurrent-job tests use this to learn the JIT-mint ID
@@ -438,6 +443,7 @@ func (s *Server) routes() http.Handler {
 	r.Delete("/_apis/runtime/runnerscalesets/{id}/sessions/{sid}", s.handleSessionDelete)
 	r.Post("/_apis/runtime/runnerscalesets/{id}/acquirejobs", s.handleAcquireJobs)
 	r.Post("/_apis/runtime/runnerscalesets/{id}/generatejitconfig", s.handleGenerateJIT)
+	r.Get("/_apis/distributedtask/pools/{pool}/agents", s.handleRunnerLookup)
 	r.Delete("/_apis/runtime/runners/{id}", s.handleRunnerDelete)
 	// scaleset.Client.RemoveRunner uses the distributed-task surface
 	// (a separate path from /_apis/runtime/runners). Real GitHub

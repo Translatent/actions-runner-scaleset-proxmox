@@ -86,6 +86,13 @@ type fakeRunnerReference struct {
 	RunnerScaleSetID int    `json:"runnerScaleSetId"`
 }
 
+// JITAttempt records every generatejitconfig request, including requests that
+// an injected fault rejects before minting a runner.
+type JITAttempt struct {
+	Name       string `json:"name"`
+	WorkFolder string `json:"workFolder"`
+}
+
 // ---------------------------------------------------------------------------
 // Configuration knobs
 // ---------------------------------------------------------------------------
@@ -408,13 +415,28 @@ func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
 	if entry == nil {
 		return
 	}
-	var body struct {
-		Name       string `json:"name"`
-		WorkFolder string `json:"workFolder"`
-	}
+	var body JITAttempt
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	s.mu.Lock()
+	entry.jitAttempts = append(entry.jitAttempts, body)
+	if fault, ok := s.takeGenerateJITFaultLocked(); ok {
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fault.status)
+		if fault.status == http.StatusUnauthorized {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"typeName": "InvalidTokenException",
+				"message":  "Invalid token",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"typeName": "RunnerScaleSetException",
+			"message":  fmt.Sprintf("injected generate JIT failure: HTTP %d", fault.status),
+		})
+		return
+	}
 	entry.jitMintCount++
 	// Synthesize a runner ID. Per-scaleset counters keep
 	// existing single-scaleset tests stable (first mint = 100001);
@@ -445,6 +467,22 @@ func (s *Server) handleGenerateJIT(w http.ResponseWriter, r *http.Request) {
 		},
 		EncodedJITConfig: base64.StdEncoding.EncodeToString(jitBlob),
 	})
+}
+
+func (s *Server) handleRunnerLookup(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("agentName")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	refs := make([]fakeRunnerReference, 0, 1)
+	for _, runner := range s.runners {
+		if runner.Name == name {
+			refs = append(refs, fakeRunnerReference{ID: int(runner.ID), Name: runner.Name})
+		}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Count int                   `json:"count"`
+		Value []fakeRunnerReference `json:"value"`
+	}{Count: len(refs), Value: refs})
 }
 
 func (s *Server) handleRunnerDelete(w http.ResponseWriter, r *http.Request) {
@@ -500,6 +538,19 @@ func (s *Server) JITMintCountFor(name string) int {
 	defer s.mu.Unlock()
 	return entry.jitMintCount
 }
+
+// JITAttempts returns a copy of every attempted request body for the single
+// configured scale set, including injected failures.
+func (s *Server) JITAttempts() []JITAttempt {
+	entry := s.onlyEntry("JITAttempts")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]JITAttempt(nil), entry.jitAttempts...)
+}
+
+// JITAttemptCount returns the number of generatejitconfig requests, whether
+// rejected or successfully minted.
+func (s *Server) JITAttemptCount() int { return len(s.JITAttempts()) }
 
 // JITMintIDForRunner returns the synthesised runner ID that
 // handleGenerateJIT handed back for the given runner name on the

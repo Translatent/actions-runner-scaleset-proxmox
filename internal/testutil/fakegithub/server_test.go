@@ -108,6 +108,42 @@ func TestServer_ScalesetAccessorsSmoke(t *testing.T) {
 		"no JIT mints expected without an e2e harness call")
 }
 
+func TestServer_InjectGenerateJITFailureIsBoundedAndRecordsAttempts(t *testing.T) {
+	t.Parallel()
+	srv := fakegithub.New(t, fakegithub.Options{
+		ScaleSet: fakegithub.ScaleSetOptions{Name: "jit-fault-set", ID: 99},
+	})
+	srv.InjectGenerateJITFailure(http.StatusUnauthorized, 1)
+
+	post := func(name string) *http.Response {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+			fmt.Sprintf("%s/_apis/runtime/runnerscalesets/99/generatejitconfig", srv.URL),
+			strings.NewReader(fmt.Sprintf(`{"name":%q,"workFolder":"_work"}`, name)))
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		return resp
+	}
+
+	failed := post("runner-1")
+	defer failed.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, failed.StatusCode)
+	var envelope map[string]any
+	require.NoError(t, json.NewDecoder(failed.Body).Decode(&envelope))
+	require.Equal(t, "InvalidTokenException", envelope["typeName"])
+	require.Equal(t, "Invalid token", envelope["message"])
+
+	succeeded := post("runner-1")
+	defer succeeded.Body.Close()
+	require.Equal(t, http.StatusOK, succeeded.StatusCode)
+	require.Equal(t, 2, srv.JITAttemptCount())
+	require.Equal(t, []fakegithub.JITAttempt{
+		{Name: "runner-1", WorkFolder: "_work"},
+		{Name: "runner-1", WorkFolder: "_work"},
+	}, srv.JITAttempts())
+	require.Equal(t, 1, srv.JITMintCount(), "rejected request must not mutate successful mint state")
+}
+
 func TestServer_UnsupportedEndpointReturns501(t *testing.T) {
 	t.Parallel()
 	srv := fakegithub.New(t, fakegithub.Options{})
