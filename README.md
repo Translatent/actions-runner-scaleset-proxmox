@@ -140,6 +140,14 @@ The same binary supports both single-process and Kubernetes multi-replica deploy
 
 A Helm chart for Kubernetes deployment lives in [deploy/chart/](deploy/chart/).
 
+## Releases
+
+[`deploy/chart/Chart.yaml`](deploy/chart/Chart.yaml) is the single release
+version source: `version` and `appVersion` must contain the same
+`MAJOR.MINOR.PATCH` value. A push to `main` creates the corresponding `v` tag
+and GitHub Release directly when that version is new; an existing release is a
+successful no-op.
+
 ## Development
 
 Common workflows ship as [Taskfile](https://taskfile.dev) targets — `task --list` to discover them:
