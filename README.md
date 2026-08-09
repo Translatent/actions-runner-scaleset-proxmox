@@ -14,9 +14,9 @@ The service implements the [`actions/scaleset`](https://github.com/actions/scale
 
 The scaler-side Actions admin client is refreshable independently of the active listener session. If `generatejitconfig` returns HTTP 401, the scaler compare-and-refreshes the exact failed client pointer so concurrent stale requests converge on one replacement, then retries the identical JIT request once. No other HTTP status is retried by this mechanism. A failed refresh or retry releases the VM for normal demand reconciliation; the listener session and its cursor remain intact. `scaleset_jit_token_refresh_total{scaleset,outcome}` exports the bounded `success` and `failure` outcomes, while the original 401 remains visible in `scaleset_github_api_errors_total{endpoint="generate_jit"}`.
 
-A second control loop — the **GitHub REST reconciler** — periodically lists the runners API and joins the result against the local DB. It is the backstop for the listener occasionally dropping `JobStarted` / `JobCompleted` callbacks or delivering them with empty fields: rows stuck in `assigned` past `assigned_grace`, `running` rows whose runner went idle past `running_idle_grace`, and runners that registered then went offline are all force-destroyed. It also sweeps Proxmox for VMs that carry our owner tags but have no matching DB row (with `orphan_grace` to avoid racing the boot pipeline), and removes orphan GitHub runner registrations whose VM is gone.
+A second control loop — the **GitHub REST reconciler** — periodically lists the runners API and joins the result against the local DB. It is the backstop for the listener occasionally dropping `JobStarted` / `JobCompleted` callbacks or delivering them with empty fields: rows stuck in `assigned` past `assigned_grace`, `running` rows whose runner went idle past `running_idle_grace`, and runners that registered then went offline are all force-destroyed. It also sweeps the scaleset's Proxmox resource pool for VMs with no matching DB row (with `orphan_grace` to avoid racing the boot pipeline), and removes orphan GitHub runner registrations whose VM is gone.
 
-State lives in-process in [hashicorp/go-memdb](https://github.com/hashicorp/go-memdb) — no on-disk DB, no migrations. On startup the orchestrator reconciles its empty view against Proxmox by listing VMs tagged as owned by this scale set; any leftovers from a previous process are destroyed.
+State lives in-process in [hashicorp/go-memdb](https://github.com/hashicorp/go-memdb) — no on-disk DB, no migrations. On startup the orchestrator reconciles its empty view against Proxmox by listing members of this scale set's resource pool; any leftovers from a previous process are destroyed.
 
 The leader also runs a fail-closed orphan-disk sweep. It considers only image
 volumes whose VMID is inside a currently configured scale-set range, has no
@@ -42,11 +42,11 @@ An optional `nodes.affinity:` block layers profile-keyed rules over the chosen s
 
 ## Multi-scaleset schema
 
-The config now accepts a top-level `scalesets:` list — one entry per scale set, each carrying its own `name`, `labels`, `max_concurrent_runners`, GitHub `scope:` (org/repo), `vmid_range`, and per-scaleset `profiles:` (issue #1). The legacy singular form (`scaleset:` + top-level `profiles:` + `github.scope`) is automatically normalised into a 1-element `scalesets:` list at load time, so existing configs keep working unchanged. Mixing the two shapes is rejected at load with a clear error pointing at the offending legacy keys. With more than one scaleset declared, every entry MUST carry its own `vmid_range` and the ranges must be pairwise disjoint — each scaleset's pool manager runs an independent VMID allocator, so sharing one range would race on Proxmox clone (issue #222).
+The config accepts a top-level `scalesets:` list — one entry per scale set, each carrying its own `name`, explicit unique Proxmox `pool`, `labels`, `max_concurrent_runners`, GitHub `scope:` (org/repo), `vmid_range`, and per-scaleset `profiles:` (issue #1). Pool names are never derived from scale-set names. The legacy singular form (`scaleset:` + top-level `profiles:` + `github.scope`) is automatically normalised into a 1-element `scalesets:` list at load time. Mixing the two shapes is rejected at load with a clear error pointing at the offending legacy keys. With more than one scaleset declared, every entry MUST carry its own `vmid_range` and the ranges must be pairwise disjoint — each scaleset's pool manager runs an independent VMID allocator, so sharing one range would race on Proxmox clone (issue #222).
 
 Every per-scaleset Prometheus metric now carries `scaleset=<name>` as its first label so dashboards can slice cleanly. Admin endpoints are also reachable under `/admin/{scaleset}/...` (e.g. `/admin/{scaleset}/state`, `/admin/{scaleset}/preempt/{vmid}`, `/admin/{scaleset}/template/promote/{profile}`); the un-namespaced `/admin/...` paths keep working for backwards compatibility when there is exactly one scale set.
 
-**Runtime fan-out:** under leader election, each declared scale set runs its own per-scaleset pool manager, scaler, listener, GitHub REST reconciler, canary controller, schedule runner, store, and provisioner (with its own owner-tagged crash recovery). The per-scaleset workers are spawned under a single supervisor errgroup: a panic or returned error in one worker is recovered and logged but does NOT propagate to its siblings, so one failing scale set never poisons the others. Sibling shutdown only happens via process-wide ctx cancel (SIGTERM, admin drain, leader deposal). Readiness is leader-aware AND per-scaleset: `/readyz` only flips green when every registered scale set has signaled both listener-connected and recovery-done; one stalled scale set is enough to hold the gate red.
+**Runtime fan-out:** under leader election, each declared scale set runs its own per-scaleset pool manager, scaler, listener, GitHub REST reconciler, canary controller, schedule runner, store, and provisioner (with its own resource-pool crash recovery). The per-scaleset workers are spawned under a single supervisor errgroup: a panic or returned error in one worker is recovered and logged but does NOT propagate to its siblings, so one failing scale set never poisons the others. Sibling shutdown only happens via process-wide ctx cancel (SIGTERM, admin drain, leader deposal). Readiness is leader-aware AND per-scaleset: `/readyz` only flips green when every registered scale set has signaled both listener-connected and recovery-done; one stalled scale set is enough to hold the gate red.
 
 ## Runner profiles
 
@@ -96,18 +96,23 @@ The source under `internal/...` is the canonical reference for behaviour; packag
 
 ## Ownership and destructive-action safety
 
-VMID range membership is defense in depth, not proof that a VM belongs to this
-scaler. Every stop/delete/purge path first reads the current Proxmox VM and
-requires this scale set's live owner tag. The only exemption is a VM whose
-`qmclone` task completed successfully and whose VMID remains precisely tracked
-while owner-tag application is pending; a clone collision never receives that
-exemption.
+Ownership is membership in the scaleset's explicit Proxmox resource pool. The
+pool is set in the clone request itself, and every stop/delete/purge path reads
+that pool before acting. Proxmox ACLs enforce the same boundary: the scaler
+token has lifecycle authority on its runner pool, not blanket `/vms` authority.
+VMID ranges remain allocation partitions, while owner/profile/template tags are
+metadata used for routing and diagnostics rather than destructive proof.
 
-If the live identity does not match, the scaler performs no lifecycle action,
-abandons the stale in-memory row, logs the VMID/node/name/tags, and quarantines
-the VMID from allocation for the rest of the process lifetime. Transient rows
+If the VM is not a pool member, the scaler performs no lifecycle action,
+abandons the stale in-memory row, logs the VMID/node/name/pool/tags, and
+quarantines the VMID from allocation for the rest of the process lifetime. A
+gauge reports runner-named VMs inside the allocation range but outside the
+pool. Transient rows
 are likewise abandoned and quarantined once they reach
 `pool.stuck_row_max_age` (default `30m`) instead of being retried forever.
+
+Runner templates 201/202/203 remain in `fleet-backup` and must never join the
+runner pool; the scaler receives clone-only ACLs on those template paths.
 
 ## Observability
 

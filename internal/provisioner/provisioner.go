@@ -60,8 +60,8 @@ var (
 	// rather than burning the VM.
 	ErrGuestAgentNotReady = errors.New("provisioner: qemu-guest-agent not ready")
 
-	// ErrOwnershipMismatch means the current VM at a requested VMID does not
-	// carry this scale set's owner tag. Callers must abandon stale state
+	// ErrOwnershipMismatch means the current VM at a requested VMID is not a
+	// member of this scale set's resource pool. Callers must abandon stale state
 	// instead of retrying a destructive operation against that VMID.
 	ErrOwnershipMismatch = errors.New("provisioner: live VM ownership mismatch")
 )
@@ -69,15 +69,17 @@ var (
 // OwnershipMismatchError records the live Proxmox identity that caused a
 // destructive operation to be refused.
 type OwnershipMismatchError struct {
-	VMID int
-	Node string
-	Name string
-	Tags string
+	VMID         int
+	Node         string
+	Name         string
+	Tags         string
+	Pool         string
+	ExpectedPool string
 }
 
 func (e *OwnershipMismatchError) Error() string {
-	return fmt.Sprintf("%v: vmid=%d node=%s name=%q tags=%q",
-		ErrOwnershipMismatch, e.VMID, e.Node, e.Name, e.Tags)
+	return fmt.Sprintf("%v: vmid=%d node=%s name=%q pool=%q expected_pool=%q tags=%q",
+		ErrOwnershipMismatch, e.VMID, e.Node, e.Name, e.Pool, e.ExpectedPool, e.Tags)
 }
 
 func (e *OwnershipMismatchError) Unwrap() error { return ErrOwnershipMismatch }
@@ -123,6 +125,7 @@ type CloneOptions struct {
 	MemoryMB     int
 	DiskGB       int
 	Storage      string
+	Pool         string
 
 	// TemplateClass is "stable" or "candidate" — stamped onto
 	// the VM's Proxmox tag for canary attribution. Empty
@@ -223,21 +226,25 @@ type Provisioner interface {
 	InFlightCloneCount() int
 }
 
+// OwnershipResidualAuditor is implemented by production provisioners that can
+// detect runner-shaped VMs outside their configured ownership pool.
+type OwnershipResidualAuditor interface {
+	CountUnpooledRunnerVMs(context.Context, []*VM) (int, error)
+}
+
 // pmox is the production Provisioner backed by github.com/luthermonson/go-proxmox.
 type pmox struct {
 	cfg          config.ProxmoxConfig
 	cli          *proxmox.Client
 	scaleSetName string
-	vmNamePrefix string // e.g. "gh-runner-<scaleset>-" — used to detect untagged orphans
+	poolID       string
 	templateNode string
 	log          *slog.Logger
 
 	// inFlightClones tracks VMIDs currently inside Clone() between the
 	// PVE qmclone task returning and the follow-up qmconfig that applies
-	// our owner tags. ListOwnedVMs consults this so the brief untagged
-	// window doesn't flap a "list-owned: untagged orphan detected"
-	// warning under sustained load. Values are the timestamp the entry
-	// was inserted (kept for diagnostics; the library handles expiry).
+	// our owner tags. Values are the timestamp the entry was inserted
+	// (kept for diagnostics; the library handles expiry).
 	//
 	// The cache's TTL bounds how long an entry survives in case Clone
 	// hangs and never returns to clear it. Set via the constructor from
@@ -282,17 +289,10 @@ type Options struct {
 // New constructs a Proxmox-backed Provisioner. It performs a one-time
 // scan of the cluster to locate the template VMID and caches the result.
 //
-// vmNamePrefix is used during ListOwnedVMs as a belt-and-suspenders
-// fallback to detect orphans whose tag-apply step failed mid-clone (the
-// canonical "Proxmox clone returned but the orchestrator crashed before
-// applying our owner tag" failure mode). The go-proxmox library v0.7.0
-// doesn't support tags-at-clone-time, so we can't make clone+tag fully
-// atomic — name-prefix + VMID-range matching plugs the gap.
-//
 // The provided ctx governs the ttlcache background eviction goroutines
 // that prune stale in-flight clone and recently-destroyed entries.
 // Cancel the context to stop the trackers at shutdown.
-func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePrefix string, opts Options, log *slog.Logger) (Provisioner, error) {
+func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, poolID string, opts Options, log *slog.Logger) (Provisioner, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -307,7 +307,7 @@ func New(ctx context.Context, cfg config.ProxmoxConfig, scaleSetName, vmNamePref
 		cfg:               cfg,
 		cli:               cli,
 		scaleSetName:      scaleSetName,
-		vmNamePrefix:      vmNamePrefix,
+		poolID:            poolID,
 		log:               log,
 		inFlightClones:    newTracker(opts.CloneInflightTTL),
 		recentlyDestroyed: newTracker(opts.RecentlyDestroyedTTL),
@@ -451,13 +451,6 @@ func (p *pmox) Ping(ctx context.Context) error {
 // connection is established. Tests may override this.
 var templateDiscoveryTimeoutPerNode = 30 * time.Second
 
-// listOwnedVMsTimeoutPerNode caps how long ListOwnedVMs may spend
-// querying a single node before logging a warn and moving on.
-// sweepProxmoxOrphans runs every reconcile tick; a hung node would
-// otherwise stall the tick for the HTTP client's full timeout (~60s).
-// Tests may override this.
-var listOwnedVMsTimeoutPerNode = 15 * time.Second
-
 // discoverTemplateNode walks the cluster to find the node hosting the
 // configured template VMID. If a node has the VMID but the VM isn't a
 // template, the scan continues (the VMID might appear on multiple nodes
@@ -562,11 +555,15 @@ func (p *pmox) Clone(ctx context.Context, opts CloneOptions) (*VM, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := newVM.Config(ctx, configOpts...); err != nil {
+	task, err = newVM.Config(ctx, configOpts...)
+	if err != nil {
 		return nil, fmt.Errorf("set owner tags / overrides: %w", err)
 	}
-	// Owner tags are now the durable proof; the narrow tag-pending exemption
-	// is no longer needed even if a later resize/start step fails.
+	if err := awaitTask(ctx, task, 60); err != nil {
+		return nil, fmt.Errorf("await owner tag / override task: %w", err)
+	}
+	// Owner metadata and hardware overrides are confirmed applied; clone-
+	// failure cleanup no longer needs the in-flight marker.
 	p.inFlightClones.Delete(opts.NewVMID)
 
 	// Disk resize is a distinct API endpoint (not Config). Apply after
@@ -632,6 +629,7 @@ func buildLibCloneOptions(opts CloneOptions, templateNodeName string) *proxmox.V
 	cloneOpts := &proxmox.VirtualMachineCloneOptions{
 		NewID: opts.NewVMID,
 		Name:  opts.Name,
+		Pool:  opts.Pool,
 	}
 	if opts.Linked {
 		cloneOpts.Full = proxmox.IntOrBool(false)
@@ -749,23 +747,38 @@ func (p *pmox) Stop(ctx context.Context, vm *VM) error {
 		}
 		return err
 	}
-	if err := p.requireDestructiveOwnership(pVM); err != nil {
+	if err := p.requireDestructiveOwnership(ctx, pVM); err != nil {
 		return err
 	}
 	return p.stopInternal(ctx, pVM)
 }
 
-func (p *pmox) requireDestructiveOwnership(pVM *proxmox.VirtualMachine) error {
+func (p *pmox) requireDestructiveOwnership(ctx context.Context, pVM *proxmox.VirtualMachine) error {
 	vmid := int(pVM.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
-	if tags.IsOwnedBy(pVM.Tags, p.scaleSetName) || p.inFlightClones.Has(vmid) {
-		return nil
+	pool, err := p.cli.Pool(ctx, p.poolID, "qemu")
+	if err != nil {
+		return fmt.Errorf("read ownership pool %q: %w", p.poolID, err)
+	}
+	for _, member := range pool.Members {
+		if int(member.VMID) == vmid {
+			return nil
+		}
+	}
+	observedPool := ""
+	if cluster, clusterErr := p.cli.Cluster(ctx); clusterErr == nil {
+		if resources, resourcesErr := cluster.Resources(ctx, "vm"); resourcesErr == nil {
+			for _, resource := range resources {
+				if int(resource.VMID) == vmid {
+					observedPool = resource.Pool
+					break
+				}
+			}
+		}
 	}
 	p.QuarantineVMID(vmid)
 	return &OwnershipMismatchError{
-		VMID: vmid,
-		Node: pVM.Node,
-		Name: pVM.Name,
-		Tags: pVM.Tags,
+		VMID: vmid, Node: pVM.Node, Name: pVM.Name, Tags: pVM.Tags,
+		Pool: observedPool, ExpectedPool: p.poolID,
 	}
 }
 
@@ -812,7 +825,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		}
 		return err
 	}
-	if err := p.requireDestructiveOwnership(pVM); err != nil {
+	if err := p.requireDestructiveOwnership(ctx, pVM); err != nil {
 		return err
 	}
 	// Reuse the resolved handle for the stop step — Destroy is on the
@@ -936,81 +949,41 @@ func (p *pmox) WaitReady(ctx context.Context, vm *VM, timeout time.Duration) err
 	return nil
 }
 
-// ListOwnedVMs returns every VM the orchestrator should consider its
-// own, scanned across all nodes. A VM is considered ours when EITHER:
-//
-//   - It carries our owner tag (the normal case), OR
-//   - It has our VM-name prefix AND its VMID is inside our configured
-//     range. This catches the rare "clone returned but tag-apply
-//     crashed" case where the VM exists in Proxmox but is missing the
-//     tag the first detection layer relies on.
-//
-// Used by the crash-recovery pass on startup; the manager destroys
-// every result whose VMID isn't already tracked in the in-memory store.
+// ListOwnedVMs returns the members of this scaleset's Proxmox resource pool.
+// Pool membership is the ownership proof; tags remain routing metadata.
 func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
-	statuses, err := p.cli.Nodes(ctx)
+	pool, err := p.cli.Pool(ctx, p.poolID, "qemu")
 	if err != nil {
-		return nil, fmt.Errorf("list nodes: %w", err)
+		return nil, fmt.Errorf("list ownership pool %q: %w", p.poolID, err)
 	}
-	var out []*VM
-	for _, ns := range statuses {
-		// Per-node timeout so one hung Proxmox node cannot pin the
-		// reconciler's orphan-sweep tick for the full HTTP client
-		// timeout. On timeout we log + skip the node; partial results
-		// are still returned to the caller.
-		nodeCtx, cancel := context.WithTimeout(ctx, listOwnedVMsTimeoutPerNode)
-		node, err := p.cli.Node(nodeCtx, ns.Node)
-		if err != nil {
-			cancel()
-			p.log.Warn("list-owned: get node failed; skipping", "node", ns.Node, "err", err)
-			continue
-		}
-		vms, err := node.VirtualMachines(nodeCtx)
-		cancel()
-		if err != nil {
-			p.log.Warn("list-owned: list vms failed; skipping", "node", ns.Node, "err", err)
-			continue
-		}
-		for _, v := range vms {
-			vmid := int(v.VMID) // #nosec G115 -- VMIDs are bounded by VMIDRange (typically 10000..19999); overflow unreachable.
-			owned := tags.IsOwnedBy(v.Tags, p.scaleSetName)
-			// Untagged orphan detection — both predicates must hold so
-			// we never reap a human-created VM that just happens to
-			// sit in our range.
-			untaggedOrphan := !owned &&
-				p.vmNamePrefix != "" &&
-				strings.HasPrefix(v.Name, p.vmNamePrefix) &&
-				vmid >= p.cfg.VMIDRange.Min &&
-				vmid <= p.cfg.VMIDRange.Max
-			if !owned && !untaggedOrphan {
-				continue
-			}
-			if untaggedOrphan {
-				// Suppress the warning when this VMID is currently
-				// inside a Clone() call between qmclone returning and
-				// the follow-up qmconfig tag-apply: the orchestrator
-				// already knows it owns this VM, so the "missing tag"
-				// observation is expected, not anomalous.
-				if p.inFlightClones.Has(vmid) {
-					p.log.Debug("list-owned: vm seen mid-clone; tag-apply pending",
-						"vmid", vmid, "node", ns.Node, "name", v.Name)
-				} else {
-					p.log.Warn("list-owned: untagged orphan detected (likely crash mid-clone)",
-						"vmid", vmid, "node", ns.Node, "name", v.Name)
-				}
-			}
-			// Decode the profile tag now so the adoption path can
-			// route the VM into the right per-profile pool without
-			// re-parsing the wire format. Empty string falls back to
-			// the default profile via tags.ProfileOf semantics.
-			profile := ""
-			if owned {
-				profile = tags.ProfileOf(v.Tags)
-			}
-			out = append(out, &VM{VMID: vmid, Node: ns.Node, Name: v.Name, Profile: profile})
-		}
+	out := make([]*VM, 0, len(pool.Members))
+	for _, member := range pool.Members {
+		out = append(out, &VM{
+			VMID: int(member.VMID), Node: member.Node, Name: member.Name,
+			Profile: tags.ProfileOf(member.Tags),
+		})
 	}
 	return out, nil
+}
+
+// CountUnpooledRunnerVMs reports tracked runner VMs outside the ownership
+// pool. It is detection only and does not grant destructive authority.
+func (p *pmox) CountUnpooledRunnerVMs(ctx context.Context, candidates []*VM) (int, error) {
+	pool, err := p.cli.Pool(ctx, p.poolID, "qemu")
+	if err != nil {
+		return 0, fmt.Errorf("list ownership pool %q: %w", p.poolID, err)
+	}
+	members := make(map[int]struct{}, len(pool.Members))
+	for _, member := range pool.Members {
+		members[int(member.VMID)] = struct{}{}
+	}
+	count := 0
+	for _, candidate := range candidates {
+		if _, ok := members[candidate.VMID]; !ok {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // getVM resolves *VM into the library's *proxmox.VirtualMachine.

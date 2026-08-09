@@ -81,6 +81,8 @@ type Config struct {
 	// runner name (e.g. "gh-runner-proxmox-ubuntu-x64-"). Runners NOT
 	// matching this prefix are ignored.
 	RunnerNamePrefix string
+	VMIDMin          int
+	VMIDMax          int
 
 	// ScaleSetName is the human-readable identifier recorded as
 	// the `scaleset` label on every metric this reconciler emits
@@ -742,8 +744,8 @@ func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
 	return nil
 }
 
-// sweepProxmoxOrphans finds VMs that Proxmox knows about (and that carry
-// our owner tags) but our DB does not. These are the inverse of the
+// sweepProxmoxOrphans finds VMs in our Proxmox resource pool that our DB does
+// not know about. These are the inverse of the
 // orphan-runner case: a process restart left a VM running with no DB row
 // to drive it. The recovery flow at startup handles this once; the
 // reconciler does it every tick so out-of-band VMs (e.g., manual `qm
@@ -759,6 +761,21 @@ func (r *Reconciler) removeRunner(ctx context.Context, id int64) error {
 // does not exist"). Entries are pruned when the VM reappears in
 // `known` on a later tick.
 func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSnapshot) {
+	if auditor, ok := r.prov.(provisioner.OwnershipResidualAuditor); ok {
+		candidates := make([]*provisioner.VM, 0, len(rows))
+		for _, row := range rows {
+			if row.VMID >= r.cfg.VMIDMin && row.VMID <= r.cfg.VMIDMax && strings.HasPrefix(row.Name, r.cfg.RunnerNamePrefix) {
+				candidates = append(candidates, &provisioner.VM{VMID: row.VMID, Node: row.Node, Name: row.Name})
+			}
+		}
+		count, err := auditor.CountUnpooledRunnerVMs(ctx, candidates)
+		if err != nil {
+			r.metrics.RecordProxmoxError(r.cfg.ScaleSetName, "list_vms", "cluster")
+			r.log.Warn("reconcile: count unpooled runner VMs failed", "err", err)
+		} else if r.metrics != nil {
+			r.metrics.UnpooledRunnerVMs.WithLabelValues(r.cfg.ScaleSetName).Set(float64(count))
+		}
+	}
 	pmoxVMs, err := r.prov.ListOwnedVMs(ctx)
 	if err != nil {
 		r.log.Warn("reconcile: list-owned-vms failed", "err", err)
@@ -795,6 +812,7 @@ func (r *Reconciler) sweepProxmoxOrphans(ctx context.Context, rows []pool.RowSna
 		r.log.Warn("reconcile: orphan proxmox vm; destroying",
 			"vmid", pv.VMID, "node", pv.Node, "orphan_age", now.Sub(first))
 		if err := r.prov.Destroy(ctx, pv); err != nil {
+			r.metrics.RecordProxmoxError(r.cfg.ScaleSetName, "destroy", pv.Node)
 			r.log.Warn("reconcile: destroy orphan failed", "vmid", pv.VMID, "err", err)
 			continue
 		}

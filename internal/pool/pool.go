@@ -223,7 +223,7 @@ type Manager interface {
 	Stats(ctx context.Context) (Stats, error)
 
 	// Adopt seeds the (empty) in-memory state from Proxmox + GitHub
-	// observations on startup, preserving every owner-tagged VM and its
+	// observations on startup, preserving every resource-pool VM and its
 	// in-flight job across leader transitions. For each VM returned by
 	// Provisioner.ListOwnedVMs, it queries the VM's Proxmox power state
 	// and (when a RunnerLister is wired) the corresponding GitHub

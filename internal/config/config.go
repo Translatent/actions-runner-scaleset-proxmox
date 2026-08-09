@@ -353,6 +353,7 @@ type GitHubScope struct {
 // active shape.
 type ScaleSetConfig struct {
 	Name                 string   `yaml:"name"`
+	Pool                 string   `yaml:"pool"`
 	Labels               []string `yaml:"labels"`
 	RunnerGroup          string   `yaml:"runner_group"`
 	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"gte=0,lte=1000000"`
@@ -367,7 +368,10 @@ type ScaleSetConfig struct {
 type ScaleSetEntry struct {
 	// Identity fields (mirror ScaleSetConfig). Required on each
 	// entry.
-	Name                 string   `yaml:"name" validate:"required"`
+	Name string `yaml:"name" validate:"required"`
+	// Pool is the explicit Proxmox resource pool whose membership is the
+	// ownership boundary for this scaleset. It is never derived from Name.
+	Pool                 string   `yaml:"pool" validate:"required"`
 	Labels               []string `yaml:"labels"`
 	RunnerGroup          string   `yaml:"runner_group"`
 	MaxConcurrentRunners int      `yaml:"max_concurrent_runners" validate:"required,gt=0,lte=1000000"`
@@ -409,6 +413,7 @@ type ScaleSetEntry struct {
 func (e ScaleSetEntry) asScaleSetConfig() ScaleSetConfig {
 	return ScaleSetConfig{
 		Name:                 e.Name,
+		Pool:                 e.Pool,
 		Labels:               e.Labels,
 		RunnerGroup:          e.RunnerGroup,
 		MaxConcurrentRunners: e.MaxConcurrentRunners,
@@ -1291,6 +1296,7 @@ func (c *Config) ApplyDefaults() {
 	if len(c.Scalesets) == 0 && (c.ScaleSet.Name != "" || c.ScaleSet.MaxConcurrentRunners != 0) {
 		c.Scalesets = []ScaleSetEntry{{
 			Name:                 c.ScaleSet.Name,
+			Pool:                 c.ScaleSet.Pool,
 			Labels:               append([]string(nil), c.ScaleSet.Labels...),
 			RunnerGroup:          c.ScaleSet.RunnerGroup,
 			MaxConcurrentRunners: c.ScaleSet.MaxConcurrentRunners,
@@ -1635,12 +1641,21 @@ func (c *Config) validateScalesets() error {
 		return errors.New("scalesets: at least one scale set must be declared (or use the legacy singular `scaleset:` form)")
 	}
 	seenName := make(map[string]int, len(c.Scalesets))
+	seenPool := make(map[string]int, len(c.Scalesets))
 	seenScope := make(map[string]int, len(c.Scalesets))
 	for i, s := range c.Scalesets {
 		if prev, dup := seenName[s.Name]; dup {
 			return fmt.Errorf("scalesets: duplicate name %q at indexes %d and %d", s.Name, prev, i)
 		}
 		seenName[s.Name] = i
+		if s.Pool == "" {
+			return fmt.Errorf("scalesets[%d] %q: pool is required", i, s.Name)
+		}
+		if prev, dup := seenPool[s.Pool]; dup {
+			return fmt.Errorf("scalesets: %q and %q share pool %q — every scaleset must use a unique Proxmox resource pool",
+				c.Scalesets[prev].Name, s.Name, s.Pool)
+		}
+		seenPool[s.Pool] = i
 
 		hasOrg := s.Scope.Org != ""
 		hasRepo := s.Scope.Repo != ""

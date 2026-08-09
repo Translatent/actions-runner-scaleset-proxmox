@@ -119,6 +119,18 @@ func New(t testing.TB, opts Options) *Server {
 // etc.).
 func (s *Server) SeedVM(node string, vmid int, name string, running bool, tags []string) {
 	s.store.seedVM(node, vmid, name, false, running, tags)
+	s.store.mu.Lock()
+	s.store.vms[vmid].Pool = "test-pool"
+	s.store.mu.Unlock()
+}
+
+// SetVMPool moves a seeded VM into (or out of, with an empty value) a pool.
+func (s *Server) SetVMPool(vmid int, pool string) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if vm, ok := s.store.vms[vmid]; ok {
+		vm.Pool = pool
+	}
 }
 
 // Snapshot returns a stable, sorted view of all VMs currently in the
@@ -187,6 +199,9 @@ func (s *Server) routes() http.Handler {
 	r.Get("/nodes/{node}/qemu", s.handleListVMs)
 	r.Get("/nodes/{node}/qemu/{vmid}/status/current", s.handleVMStatus)
 	r.Get("/nodes/{node}/qemu/{vmid}/config", s.handleVMConfig)
+	r.Get("/pools/", s.handlePools)
+	r.Get("/cluster/status", func(w http.ResponseWriter, _ *http.Request) { writeData(w, []any{}) })
+	r.Get("/cluster/resources", s.handleClusterResources)
 	r.Post("/nodes/{node}/qemu/{vmid}/clone", s.handleClone)
 	// VM config supports both POST (async, returns UPID) and PUT (sync,
 	// returns null). go-proxmox's VM.Config uses POST; older clients
@@ -287,6 +302,40 @@ func (s *Server) knownNode(name string) bool {
 	return false
 }
 
+func (s *Server) handlePools(w http.ResponseWriter, r *http.Request) {
+	poolID := r.URL.Query().Get("poolid")
+	if poolID == "" {
+		poolID = "test-pool"
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	members := make([]map[string]any, 0)
+	for _, vm := range s.store.vms {
+		if vm.Pool == poolID {
+			member := vmJSON(vm)
+			member["node"] = vm.Node
+			member["pool"] = vm.Pool
+			member["type"] = "qemu"
+			members = append(members, member)
+		}
+	}
+	writeData(w, []map[string]any{{"poolid": poolID, "members": members}})
+}
+
+func (s *Server) handleClusterResources(w http.ResponseWriter, _ *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	resources := make([]map[string]any, 0, len(s.store.vms))
+	for _, vm := range s.store.vms {
+		resource := vmJSON(vm)
+		resource["node"] = vm.Node
+		resource["pool"] = vm.Pool
+		resource["type"] = "qemu"
+		resources = append(resources, resource)
+	}
+	writeData(w, resources)
+}
+
 // ---------------------------------------------------------------------------
 // VM handlers
 // ---------------------------------------------------------------------------
@@ -368,6 +417,7 @@ func (s *Server) handleClone(w http.ResponseWriter, r *http.Request) {
 		NewID  int    `json:"newid"`
 		Name   string `json:"name"`
 		Target string `json:"target"`
+		Pool   string `json:"pool"`
 		Full   any    `json:"full"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -384,7 +434,7 @@ func (s *Server) handleClone(w http.ResponseWriter, r *http.Request) {
 		target = chi.URLParam(r, "node")
 	}
 	s.store.mu.Lock()
-	_, task, err := s.store.cloneVMLocked(templateVMID, body.NewID, target, body.Name)
+	_, task, err := s.store.cloneVMLocked(templateVMID, body.NewID, target, body.Name, body.Pool)
 	s.store.mu.Unlock()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -596,6 +646,7 @@ func vmJSON(v *vmRecord) map[string]any {
 		"name":   v.Name,
 		"status": "stopped",
 		"tags":   v.Tags,
+		"pool":   v.Pool,
 	}
 	if v.Running {
 		out["status"] = "running"

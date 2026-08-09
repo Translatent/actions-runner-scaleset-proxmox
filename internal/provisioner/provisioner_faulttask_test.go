@@ -34,6 +34,21 @@ func TestAwaitTask_CloneTaskFailureSurfacesError(t *testing.T) {
 	require.Contains(t, err.Error(), "clone")
 }
 
+func TestClone_ConfigTaskFailureReturnsErrorAndKeepsInFlightMarker(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultTaskFails, TaskType: "qmconfig"})
+
+	p := newFaultProvisioner(t, fp)
+	_, err := p.Clone(context.Background(), CloneOptions{
+		NewVMID: 10042, Node: "pve1", Name: "x",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "await owner tag / override task")
+	require.True(t, p.inFlightClones.Has(10042),
+		"clone-failure cleanup needs the marker to destroy the half-built VM")
+}
+
 func TestAwaitTask_StartTaskFailureSurfacesError(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{})

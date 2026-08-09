@@ -101,6 +101,7 @@ type Metrics struct {
 	CanaryReverts        *prometheus.CounterVec
 	ScheduleFires        *prometheus.CounterVec
 	ScheduleActive       *prometheus.GaugeVec
+	UnpooledRunnerVMs    *prometheus.GaugeVec
 	Leader               prometheus.Gauge
 
 	// PoolDestroyBacklogFull counts destroy requests dropped because the
@@ -309,6 +310,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "schedule_active",
 			Help: "Active schedule override per profile (1 = currently applying).",
 		}, []string{"scaleset", "profile", "schedule"}),
+		UnpooledRunnerVMs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: ns, Name: "unpooled_runner_vms",
+			Help: "Runner-named VMs in the scaleset VMID range that are not members of its ownership pool.",
+		}, []string{"scaleset"}),
 		Leader: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: ns, Name: "leader",
 			Help: "1 when this replica holds cluster leadership, 0 when standby. Always 1 in standalone mode.",
@@ -333,7 +338,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.GHAPICalls, m.GHRateLimitRemaining, m.GHStateMismatch, m.RunnerHookEvents,
 		m.ReconcileErrors, m.UnroutedJobs,
 		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions, m.CanaryReverts,
-		m.ScheduleFires, m.ScheduleActive,
+		m.ScheduleFires, m.ScheduleActive, m.UnpooledRunnerVMs,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
 		m.PanicsRecovered,
 		m.Leader,

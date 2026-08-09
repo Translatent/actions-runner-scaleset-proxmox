@@ -16,6 +16,7 @@ type vmRecord struct {
 	Node      string
 	Name      string
 	Tags      string // semicolon-joined, sorted, deduped
+	Pool      string
 	Template  bool
 	Running   bool
 	StartedAt time.Time // wall-clock start so guest-agent delay can be enforced
@@ -72,6 +73,7 @@ func (s *store) snapshot() []VMSnapshot {
 			Node:    v.Node,
 			Name:    v.Name,
 			Tags:    v.Tags,
+			Pool:    v.Pool,
 			Running: v.Running,
 		})
 	}
@@ -87,6 +89,7 @@ type VMSnapshot struct {
 	Node    string
 	Name    string
 	Tags    string
+	Pool    string
 	Running bool
 }
 
@@ -114,7 +117,7 @@ func (s *store) findVMLocked(vmid int) (*vmRecord, bool) {
 
 // cloneVM creates a new VM by copying the template, returning a task
 // record the caller can poll. Caller must hold s.mu.
-func (s *store) cloneVMLocked(templateVMID, newVMID int, targetNode, name string) (*vmRecord, *taskRecord, error) {
+func (s *store) cloneVMLocked(templateVMID, newVMID int, targetNode, name, pool string) (*vmRecord, *taskRecord, error) {
 	if _, ok := s.vms[templateVMID]; !ok {
 		return nil, nil, fmt.Errorf("template vmid %d does not exist", templateVMID)
 	}
@@ -129,6 +132,7 @@ func (s *store) cloneVMLocked(templateVMID, newVMID int, targetNode, name string
 		Node:    targetNode,
 		Name:    name,
 		Tags:    "", // tags are applied by a subsequent PUT /config
+		Pool:    pool,
 		Running: false,
 		Config:  map[string]any{},
 	}

@@ -97,7 +97,7 @@ func ReapOrphanDisks(ctx context.Context, opts ReapOrphanDisksOptions) (diskreap
 	}
 	first := cfg.Scalesets[0]
 	prov, err := provisioner.New(ctx, cfg.Proxmox, first.Name,
-		fmt.Sprintf("gh-runner-%s-", first.Name), provisioner.Options{}, log)
+		first.Pool, provisioner.Options{}, log)
 	if err != nil {
 		return diskreaper.Result{}, fmt.Errorf("init provisioner: %w", err)
 	}
@@ -750,6 +750,7 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		Profiles:             profileSettingsForScaleset(entry, cfg),
 		Canary:               canaryCtrl,
 		ScaleSetName:         entry.Name,
+		ResourcePool:         entry.Pool,
 		VMNamePrefix:         state.vmPrefix,
 		VMIDRange:            entryVMIDRange(entry, cfg.Proxmox.VMIDRange),
 		LinkedClones:         cfg.Proxmox.Clone.LinkedOrDefault(),
@@ -840,6 +841,8 @@ func runOneScaleset(leaderCtx context.Context, deps runOneScalesetDeps, entry co
 		RunningOfflineObservations: cfg.GitHub.RunningOfflineObservations,
 		OrphanGrace:                cfg.Pool.OrphanGrace.D(),
 		RunnerNamePrefix:           state.vmPrefix,
+		VMIDMin:                    entryVMIDRange(entry, cfg.Proxmox.VMIDRange).Min,
+		VMIDMax:                    entryVMIDRange(entry, cfg.Proxmox.VMIDRange).Max,
 	}, restCli, mgr, state.prov, log, metrics)
 	if err != nil {
 		return fmt.Errorf("build gh reconciler: %w", err)
@@ -897,7 +900,7 @@ func initScalesetStates(ctx context.Context, cfg *config.Config, log *slog.Logge
 	scStates := make(map[string]*scalesetState, len(cfg.Scalesets))
 	for _, s := range cfg.Scalesets {
 		vmPrefix := fmt.Sprintf("gh-runner-%s-", s.Name)
-		prov, err := provisioner.New(ctx, cfg.Proxmox, s.Name, vmPrefix, provisioner.Options{
+		prov, err := provisioner.New(ctx, cfg.Proxmox, s.Name, s.Pool, provisioner.Options{
 			CloneInflightTTL:     cfg.Pool.CloneInflightGrace.D(),
 			RecentlyDestroyedTTL: cfg.Pool.VMIDReuseCooldown.D() * 4,
 		}, log)

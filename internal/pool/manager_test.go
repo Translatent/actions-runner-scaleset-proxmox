@@ -623,6 +623,7 @@ func TestForceDestroy_ForeignOwnershipMismatchAbandonsRowAndQuarantines(t *testi
 		HotSize:   1,
 		VMIDRange: config.VMIDRange{Min: 20000, Max: 20001},
 	})
+	before := testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1"))
 
 	require.NoError(t, mgr.ForceDestroy(context.Background(), 20000, "foreign replacement"))
 	require.Eventually(t, func() bool {
@@ -639,6 +640,8 @@ func TestForceDestroy_ForeignOwnershipMismatchAbandonsRowAndQuarantines(t *testi
 	defer fp.mu.Unlock()
 	require.Equal(t, []int{20000}, fp.destroys,
 		"ownership mismatch must abandon the row after one gated provisioner call")
+	after := testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1"))
+	require.Equal(t, before+1, after, "ownership refusal is a destroy failure and must be metered")
 }
 
 func TestSweepStuckRows_StuckRowMaxAge(t *testing.T) {

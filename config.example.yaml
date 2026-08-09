@@ -82,6 +82,7 @@ github:
 
 scaleset:
   name: proxmox-ubuntu-x64
+  pool: gh-scaleset-proxmox-ubuntu-x64 # explicit; never derived from name
   labels: [self-hosted, linux, x64, proxmox]
   runner_group: default
   max_concurrent_runners: 50
@@ -91,7 +92,7 @@ scaleset:
 # `github.scope` + top-level `profiles:` form above, declare a
 # `scalesets:` list with one entry per scale set. Each entry
 # carries its own scope (org/repo), labels, max_concurrent_runners,
-# runner_group, vmid_range, and per-scaleset `profiles:`. Mixing
+# runner_group, resource pool, vmid_range, and per-scaleset `profiles:`. Mixing
 # the two forms is rejected at load.
 #
 # Each declared scale set runs under its own pool manager, scaler,
@@ -109,6 +110,7 @@ scaleset:
 #
 # scalesets:
 #   - name: linux-x64
+#     pool: gh-scaleset-linux-x64
 #     labels: [self-hosted, linux, x64, proxmox]
 #     runner_group: default
 #     max_concurrent_runners: 50
@@ -121,6 +123,7 @@ scaleset:
 #         warm_size: 10
 #         max_concurrent_runners: 50
 #   - name: gpu-pool
+#     pool: gh-scaleset-gpu
 #     labels: [self-hosted, linux, gpu]
 #     max_concurrent_runners: 4
 #     scope: { org: my-other-org }

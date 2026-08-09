@@ -1,12 +1,10 @@
 package provisioner
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -50,6 +48,7 @@ func newTestProvisioner(t *testing.T, srv *httptest.Server, templateNode string)
 		cfg:               cfg,
 		cli:               cli,
 		scaleSetName:      "test-scaleset",
+		poolID:            "test-pool",
 		templateNode:      templateNode,
 		log:               quietLogger(),
 		inFlightClones:    newTracker(5 * time.Minute),
@@ -460,55 +459,6 @@ func TestDiscoverTemplateNode_OneHungNodeDoesNotBlock(t *testing.T) {
 	// Must complete within a small multiple of the per-node timeout.
 	require.Less(t, elapsed, 2*time.Second,
 		"discoverTemplateNode took %s; expected one hung node to be bounded by templateDiscoveryTimeoutPerNode", elapsed)
-}
-
-// TestListOwnedVMs_OneHungNodeDoesNotBlock: one unreachable node must
-// not pin sweepProxmoxOrphans for the underlying HTTP client's full
-// timeout per tick. Mirrors the per-node-timeout guarantee already in
-// place for discoverTemplateNode.
-func TestListOwnedVMs_OneHungNodeDoesNotBlock(t *testing.T) {
-	// Mutates the package-level listOwnedVMsTimeoutPerNode, which
-	// other ListOwnedVMs tests read — keep this test serial so
-	// -race doesn't flag the unsynchronised var.
-	prev := listOwnedVMsTimeoutPerNode
-	listOwnedVMsTimeoutPerNode = 200 * time.Millisecond
-	t.Cleanup(func() { listOwnedVMsTimeoutPerNode = prev })
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":[{"node":"hung"},{"node":"fast"}]}`)
-	})
-	mux.HandleFunc("/nodes/hung/status", func(_ http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
-	})
-	mux.HandleFunc("/nodes/hung/qemu", func(_ http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
-	})
-	mux.HandleFunc("/nodes/fast/status", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{}}`)
-	})
-	mux.HandleFunc("/nodes/fast/qemu", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":[]}`)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	cfg := config.ProxmoxConfig{
-		Endpoint:           srv.URL,
-		InsecureSkipVerify: true,
-		Auth:               config.ProxmoxAuth{TokenID: "a!b", TokenSecret: "x"},
-		TemplateVMID:       9000,
-		VMIDRange:          config.VMIDRange{Min: 10000, Max: 19999},
-	}
-	p := &pmox{cfg: cfg, cli: newProxmoxClient(cfg), scaleSetName: "t", log: quietLogger()}
-
-	start := time.Now()
-	vms, err := p.ListOwnedVMs(context.Background())
-	elapsed := time.Since(start)
-	require.NoError(t, err)
-	require.Empty(t, vms, "fast node has no owned VMs")
-	require.Less(t, elapsed, 2*time.Second,
-		"ListOwnedVMs took %s; one hung node should be bounded by listOwnedVMsTimeoutPerNode", elapsed)
 }
 
 func TestClone_LinkedRejectsCrossNode(t *testing.T) {
@@ -934,66 +884,6 @@ func TestNewProxmoxClient_ReachesTestServer(t *testing.T) {
 	require.True(t, strings.HasPrefix(got.Path, "/nodes"))
 }
 
-// listOwnedVMsServer returns an httptest server that answers the three
-// GET endpoints ListOwnedVMs needs: cluster node list, per-node status
-// (go-proxmox's Client.Node helper hits /nodes/{node}/status to enrich
-// the Node object), and per-node VM list. vmsJSON is the raw JSON for
-// the qemu list.
-func listOwnedVMsServer(t *testing.T, nodeName, vmsJSON string) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, `{"data":[{"node":%q,"status":"online"}]}`, nodeName)
-	})
-	mux.HandleFunc("/nodes/"+nodeName+"/status", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{}}`)
-	})
-	mux.HandleFunc("/nodes/"+nodeName+"/qemu", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, vmsJSON)
-	})
-	return httptest.NewServer(mux)
-}
-
-// TestListOwnedVMs_SuppressesUntaggedWarningForInFlightClones locks
-// in the behaviour around the qmclone→qmconfig tag-apply window.
-// During that window the VM exists in PVE with our name prefix but
-// without the owner tag; ListOwnedVMs must NOT log "untagged orphan
-// detected" for VMIDs we are actively cloning — the orchestrator
-// already owns the VM, the tag just hasn't landed yet. The VM is
-// still included in the returned slice so callers see a complete
-// owned set.
-func TestListOwnedVMs_SuppressesUntaggedWarningForInFlightClones(t *testing.T) {
-	t.Parallel()
-
-	// VM with our name prefix, in our VMID range, but NO tags — the
-	// exact window between qmclone returning and qmconfig applying
-	// tags.
-	srv := listOwnedVMsServer(t, "pve1",
-		`{"data":[{"vmid":10004,"name":"gh-runner-test-scaleset-10004","status":"running","tags":""}]}`)
-	defer srv.Close()
-
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	p := newTestProvisioner(t, srv, "pve1")
-	p.log = logger
-	p.vmNamePrefix = "gh-runner-test-scaleset-"
-	p.cfg.VMIDRange = config.VMIDRange{Min: 10000, Max: 19999}
-
-	// Mark VMID 10004 as currently being cloned — Clone has returned
-	// from PVE's clone task but hasn't yet applied the ownership tag.
-	p.inFlightClones.Set(10004, time.Now(), ttlcache.DefaultTTL)
-
-	vms, err := p.ListOwnedVMs(context.Background())
-	require.NoError(t, err)
-	require.Len(t, vms, 1,
-		"in-flight VM must still be reported as owned (the row in the store points at this VMID)")
-	require.Equal(t, 10004, vms[0].VMID)
-
-	require.NotContains(t, logBuf.String(), "untagged orphan detected",
-		"the WARN must be suppressed while the clone is in-flight; got log: %s", logBuf.String())
-}
-
 // TestTrackers_LibraryEvictsEntriesPastTTL exercises the ttlcache
 // background-eviction path our trackers rely on. Without it a hung
 // Clone() would leak an inflight entry forever (suppressing future
@@ -1086,6 +976,7 @@ func TestDestroy_ForeignVMOwnershipMismatchQuarantinesWithoutLifecycleCalls(t *t
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{})
 	fp.SeedVM("pve1", 10042, "ci-evidence", true, nil)
+	fp.SetVMPool(10042, "")
 	p := newTestProvisioner(t, fp.Server, "pve1")
 
 	err := p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"})
@@ -1108,7 +999,6 @@ func TestDestroy_PurgesUnreferencedDisks(t *testing.T) {
 	fp.SeedVM("pve1", 10042, "gh-runner-test-scaleset-10042", false,
 		[]string{"gh-scaleset", "gh-scaleset-owner-test-scaleset"})
 	p := newTestProvisioner(t, fp.Server, "pve1")
-	p.vmNamePrefix = "gh-runner-test-scaleset-"
 	p.scaleSetName = "test-scaleset"
 
 	require.NoError(t, p.Destroy(context.Background(), &VM{VMID: 10042, Node: "pve1"}))
@@ -1120,6 +1010,7 @@ func TestClone_OccupiedVMIDCreatesNoOwnershipExemption(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{TemplateVMID: 9000, TemplateNode: "pve1"})
 	fp.SeedVM("pve1", 10042, "ci-evidence", true, nil)
+	fp.SetVMPool(10042, "")
 	p := newTestProvisioner(t, fp.Server, "pve1")
 
 	_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10042, Node: "pve1", Name: "runner"})
@@ -1133,7 +1024,7 @@ func TestClone_OccupiedVMIDCreatesNoOwnershipExemption(t *testing.T) {
 	require.Equal(t, 0, fp.OperationCount(10042, "destroy"))
 }
 
-func TestClone_SuccessfulTagPendingVMRetainsCleanupExemption(t *testing.T) {
+func TestClone_PoolOwnedTagPendingVMAllowsCleanup(t *testing.T) {
 	t.Parallel()
 	fp := fakeproxmox.New(t, fakeproxmox.Options{
 		TemplateVMID: 9000, TemplateNode: "pve1", TaskDuration: time.Millisecond,
@@ -1144,61 +1035,49 @@ func TestClone_SuccessfulTagPendingVMRetainsCleanupExemption(t *testing.T) {
 	p := newTestProvisioner(t, fp.Server, "pve1")
 	cloneDone := make(chan error, 1)
 	go func() {
-		_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10043, Node: "pve1", Name: "runner"})
+		_, err := p.Clone(context.Background(), CloneOptions{NewVMID: 10043, Node: "pve1", Name: "runner", Pool: "test-pool"})
 		cloneDone <- err
 	}()
 	require.Eventually(t, func() bool { return p.inFlightClones.Has(10043) },
 		2*time.Second, 10*time.Millisecond)
 
 	err := p.Destroy(context.Background(), &VM{VMID: 10043, Node: "pve1"})
-	require.NoError(t, err, "a qmclone-completed tag-pending VM is known-owned cleanup")
+	require.NoError(t, err, "pool membership proves ownership while tag metadata is pending")
 	require.False(t, p.IsVMIDQuarantined(10043))
 	require.Positive(t, fp.OperationCount(10043, "destroy"))
 	<-cloneDone
 	require.False(t, p.inFlightClones.Has(10043))
 }
 
-// TestListOwnedVMs_PartialNodeFailureReturnsRest: if one node in the
-// cluster is unreachable (returns 500), ListOwnedVMs must log a
-// warning, skip that node, and return VMs from the reachable nodes.
-// A whole-cluster failure was the original symptom captured in
-// production ("provisioner: list nodes: not authorized" when a node
-// was down) — degrading gracefully here is critical.
-func TestListOwnedVMs_PartialNodeFailureReturnsRest(t *testing.T) {
+func TestListOwnedVMs_UsesPoolMembershipAndKeepsTagsAsMetadata(t *testing.T) {
 	t.Parallel()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/nodes", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":[
-			{"node":"pve-good","status":"online"},
-			{"node":"pve-bad","status":"unknown"}
-		]}`)
-	})
-	// Healthy node: VM that's clearly ours (correct owner tag).
-	mux.HandleFunc("/nodes/pve-good/status", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"data":{}}`)
-	})
-	mux.HandleFunc("/nodes/pve-good/qemu", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w,
-			`{"data":[{"vmid":10005,"name":"gh-runner-test-scaleset-10005","status":"running","tags":"gh-scaleset;gh-scaleset-owner-test-scaleset"}]}`)
-	})
-	// Failed node: 500 to anything.
-	mux.HandleFunc("/nodes/pve-bad/status", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	mux.HandleFunc("/nodes/pve-bad/qemu", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	p := newTestProvisioner(t, srv, "pve-good")
-	p.vmNamePrefix = "gh-runner-test-scaleset-"
-	p.cfg.VMIDRange = config.VMIDRange{Min: 10000, Max: 19999}
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10042, "runner", false,
+		[]string{"gh-scaleset-profile-gpu"})
+	fp.SeedVM("pve1", 10043, "foreign", false,
+		[]string{"gh-scaleset-owner-test-scaleset"})
+	fp.SetVMPool(10043, "")
+	p := newTestProvisioner(t, fp.Server, "pve1")
 
 	vms, err := p.ListOwnedVMs(context.Background())
-	require.NoError(t, err, "a partial failure must NOT cause the whole call to error")
-	require.Len(t, vms, 1, "the reachable node's VMs must still be returned")
-	require.Equal(t, 10005, vms[0].VMID)
+	require.NoError(t, err)
+	require.Equal(t, []*VM{{VMID: 10042, Node: "pve1", Name: "runner", Profile: "gpu"}}, vms)
+}
+
+func TestCountUnpooledRunnerVMs_DetectsWithoutGrantingOwnership(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10042, "gh-runner-test-10042", false, nil)
+	fp.SeedVM("pve1", 10043, "gh-runner-test-10043", false, nil)
+	fp.SetVMPool(10043, "")
+	p := newTestProvisioner(t, fp.Server, "pve1")
+
+	count, err := p.CountUnpooledRunnerVMs(context.Background(), []*VM{
+		{VMID: 10042, Name: "gh-runner-test-10042"},
+		{VMID: 10043, Name: "gh-runner-test-10043"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
 }
 
 // TestClone_ClearsInFlightOnError: if Clone() returns an error after
@@ -1222,32 +1101,6 @@ func TestClone_ClearsInFlightOnError(t *testing.T) {
 
 	require.False(t, p.inFlightClones.Has(10042),
 		"Clone error must still clear the in-flight entry — otherwise repeated failures permanently mute the warning for that VMID")
-}
-
-// TestListOwnedVMs_StillWarnsOnRealUntaggedOrphan is the corollary:
-// a VM matching the name prefix + VMID range but NOT in the in-flight
-// set is a genuine "crashed mid-clone" orphan from a previous
-// orchestrator process. Those still need the WARN so operators
-// notice them.
-func TestListOwnedVMs_StillWarnsOnRealUntaggedOrphan(t *testing.T) {
-	t.Parallel()
-	srv := listOwnedVMsServer(t, "pve1",
-		`{"data":[{"vmid":10004,"name":"gh-runner-test-scaleset-10004","status":"running","tags":""}]}`)
-	defer srv.Close()
-
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
-	p := newTestProvisioner(t, srv, "pve1")
-	p.log = logger
-	p.vmNamePrefix = "gh-runner-test-scaleset-"
-	p.cfg.VMIDRange = config.VMIDRange{Min: 10000, Max: 19999}
-	// NOT marking 10004 as in-flight.
-
-	_, err := p.ListOwnedVMs(context.Background())
-	require.NoError(t, err)
-	require.Contains(t, logBuf.String(), "untagged orphan detected",
-		"genuine crash-mid-clone orphans must still warn")
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,12 +1147,14 @@ func TestBuildLibCloneOptions_LinkedClone(t *testing.T) {
 		Linked:  true,
 		Node:    "pve1",
 		Storage: "fast-storage",
+		Pool:    "test-pool",
 	}, "pve1")
 	require.Equal(t, 10042, got.NewID)
 	require.Equal(t, "gh-runner-10042", got.Name)
 	require.Equal(t, proxmox.IntOrBool(false), got.Full)
 	require.Empty(t, got.Target, "linked clones must not set Target")
 	require.Empty(t, got.Storage, "linked clones must not set Storage")
+	require.Equal(t, "test-pool", got.Pool, "pool membership is atomic for linked clones too")
 }
 
 // TestBuildLibCloneOptions_FullCloneCrossNode: full clones with a
@@ -1313,10 +1168,12 @@ func TestBuildLibCloneOptions_FullCloneCrossNode(t *testing.T) {
 		Linked:  false,
 		Node:    "pve2",
 		Storage: "fast-storage",
+		Pool:    "test-pool",
 	}, "pve1")
 	require.Equal(t, proxmox.IntOrBool(true), got.Full)
 	require.Equal(t, "pve2", got.Target)
 	require.Equal(t, "fast-storage", got.Storage)
+	require.Equal(t, "test-pool", got.Pool)
 }
 
 // TestBuildLibCloneOptions_FullCloneSameNodeOmitsTarget: when the

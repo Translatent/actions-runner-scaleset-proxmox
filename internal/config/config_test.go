@@ -33,6 +33,7 @@ github:
 
 scaleset:
   name: proxmox-ubuntu-x64
+  pool: test-pool
   labels: [self-hosted, linux, proxmox]
   max_concurrent_runners: 10
 
@@ -255,11 +256,13 @@ github:
     token: testtoken
 scalesets:
   - name: a
+    pool: pool-a
     labels: [a]
     max_concurrent_runners: 5
     scope: { org: org-a }
     vmid_range: { min: 10000, max: 14999 }
   - name: b
+    pool: pool-b
     labels: [b]
     max_concurrent_runners: 5
     scope: { org: org-b }
@@ -353,6 +356,7 @@ github:
   scope: { org: o }
 scaleset:
   name: x
+  pool: test-pool
   max_concurrent_runners: 5
 proxmox:
   endpoint: https://h:8006/api2/json
@@ -407,7 +411,7 @@ github:
   auth_mode: pat
   pat: { token: testtoken }
   scope: { org: o }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -455,7 +459,7 @@ github:
   auth_mode: pat
   pat: { token: testtoken }
   scope: { org: o }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -489,7 +493,7 @@ github:
   assigned_offline_grace: 45s
   running_offline_grace: 3m
   running_offline_observations: 12
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -519,7 +523,7 @@ func TestParse_AppAuthRequiresAppBlock(t *testing.T) {
 github:
   auth_mode: app
   scope: { org: o }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -546,7 +550,7 @@ github:
     installation_id: 2
     private_key_path: ` + pem + `
   scope: { repo: o/r }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -572,7 +576,7 @@ github:
     installation_id: 2
     private_key_path: ` + pem + `
   scope: { repo: o/r }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -599,7 +603,7 @@ github:
     installation_id: 2
     private_key_path: ` + pem + `
   scope: { org: o }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -626,7 +630,7 @@ github:
     installation_id: 2
     private_key_path: ` + pem + `
   scope: { repo: o/r }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -917,6 +921,7 @@ github:
 
 scaleset:
   name: proxmox-ubuntu-x64
+  pool: test-pool
   labels: [self-hosted, linux, proxmox]
   max_concurrent_runners: 30
 
@@ -1667,12 +1672,14 @@ github:
 
 scalesets:
   - name: linux-x64
+    pool: linux-pool
     labels: [self-hosted, linux, proxmox, x64]
     max_concurrent_runners: 10
     scope:
       org: org-a
     vmid_range: { min: 10000, max: 14999 }
   - name: gpu-pool
+    pool: gpu-pool
     labels: [self-hosted, linux, gpu]
     max_concurrent_runners: 4
     scope:
@@ -1759,6 +1766,19 @@ func TestScalesets_DuplicateScopeRejected(t *testing.T) {
 	require.Contains(t, err.Error(), "share the same scope")
 }
 
+func TestScalesets_RequireExplicitUniquePools(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		missing := strings.Replace(validMultiScalesetYAML, "    pool: linux-pool\n", "", 1)
+		_, err := config.Parse([]byte(missing))
+		require.ErrorContains(t, err, `scalesets[0] "linux-x64": pool is required`)
+	})
+	t.Run("duplicate", func(t *testing.T) {
+		duplicate := strings.Replace(validMultiScalesetYAML, "    pool: gpu-pool\n", "    pool: linux-pool\n", 1)
+		_, err := config.Parse([]byte(duplicate))
+		require.ErrorContains(t, err, `share pool "linux-pool"`)
+	})
+}
+
 func TestScalesets_DuplicateNameRejected(t *testing.T) {
 	dup := strings.Replace(validMultiScalesetYAML, "name: gpu-pool", "name: linux-x64", 1)
 	_, err := config.Parse([]byte(dup))
@@ -1786,11 +1806,13 @@ github:
     token: testtoken
 scalesets:
   - name: a
+    pool: pool-a
     labels: [a]
     max_concurrent_runners: 5
     scope: { org: org-a }
     vmid_range: { min: 10000, max: 14999 }
   - name: b
+    pool: pool-b
     labels: [b]
     max_concurrent_runners: 5
     scope: { org: org-b }
@@ -2199,7 +2221,7 @@ github:
     config_url: https://ghes.example.com/myorg
     config_base_url: https://ghes.example.com
   scope: { org: o }
-scaleset: { name: x, max_concurrent_runners: 5 }
+scaleset: { name: x, pool: test-pool, max_concurrent_runners: 5 }
 proxmox:
   endpoint: https://h:8006/api2/json
   auth: { token_id: a!b, token_secret: testsecret }
@@ -2238,12 +2260,14 @@ github:
 
 scalesets:
   - name: linux-x64
+    pool: linux-pool
     labels: [self-hosted, linux, proxmox, x64]
     max_concurrent_runners: 10
     scope:
       org: org-a
     vmid_range: { min: 10000, max: 14999 }
   - name: gpu-pool
+    pool: gpu-pool
     labels: [self-hosted, linux, gpu]
     max_concurrent_runners: 4
     scope:

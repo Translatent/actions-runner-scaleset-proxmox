@@ -125,6 +125,7 @@ type Config struct {
 	PowerPollInterval time.Duration
 
 	ScaleSetName string
+	ResourcePool string
 	VMNamePrefix string // e.g. "gh-runner-<scaleset>-"
 	VMIDRange    config.VMIDRange
 	LinkedClones bool
@@ -151,7 +152,7 @@ type Config struct {
 	// and treated as a no-op (e.g. in tests).
 	OnRunnerOrphaned func(ctx context.Context, runnerID int64) error
 
-	// RunnerLister is consulted by Adopt to classify owner-tagged
+	// RunnerLister is consulted by Adopt to classify pool-owned
 	// Proxmox VMs more precisely: a VM whose runner is busy on GitHub
 	// is adopted directly as Running with the right RunnerID, skipping
 	// the Hot → reconcile → promote round-trip the gh.Reconciler would
@@ -944,7 +945,7 @@ func (m *manager) MarkCompleted(_ context.Context, vmid int) error {
 // Recover reconciles the (empty) in-memory store against Proxmox reality
 // on startup. With no persistent state to load, this collapses to
 // Adopt seeds the in-memory store from Proxmox + GitHub observations
-// for every owner-tagged VM the previous leader (or this process's
+// for every pool-owned VM the previous leader (or this process's
 // prior incarnation) left behind. The classification matrix is:
 //
 //	power=stopped                          → Warm   / PoolKindWarm
@@ -1726,6 +1727,7 @@ func (m *manager) runClone(profile string, kind store.PoolKind, poweredOn bool, 
 		MemoryMB:      prep.ps.settings.MemoryMB,
 		DiskGB:        prep.ps.settings.DiskGB,
 		Storage:       prep.ps.settings.Storage,
+		Pool:          m.cfg.ResourcePool,
 		NICs:          prep.ps.settings.NICs,
 		IPConfig:      prep.ipConfig,
 	})
@@ -2282,6 +2284,7 @@ func (m *manager) abandonOwnershipMismatch(vmid int, node, operation string, err
 	}
 	var mismatch *provisioner.OwnershipMismatchError
 	_ = errors.As(err, &mismatch)
+	m.metrics.RecordProxmoxError(m.cfg.ScaleSetName, "destroy", node)
 	if deleteErr := m.store.Delete(vmid); deleteErr != nil {
 		m.log.Warn("destroy: ownership mismatch row delete failed",
 			"vmid", vmid, "node", node, "operation", operation, "err", deleteErr)
@@ -2289,6 +2292,7 @@ func (m *manager) abandonOwnershipMismatch(vmid int, node, operation string, err
 	if mismatch != nil {
 		m.log.Warn("destroy: refusing foreign VM; abandoning row and retaining quarantine",
 			"vmid", mismatch.VMID, "node", mismatch.Node, "name", mismatch.Name,
+			"pool", mismatch.Pool, "expected_pool", mismatch.ExpectedPool,
 			"tags", mismatch.Tags, "operation", operation)
 	} else {
 		m.log.Warn("destroy: refusing foreign VM; abandoning row and retaining quarantine",

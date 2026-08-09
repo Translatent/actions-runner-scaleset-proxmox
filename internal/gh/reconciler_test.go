@@ -164,6 +164,7 @@ type stubProv struct {
 	mu       sync.Mutex
 	owned    []*provisioner.VM
 	destroys []int
+	unpooled int
 
 	// destroyErr, when non-nil, is returned from every Destroy call —
 	// used to exercise the retry-on-failure branch of sweepProxmoxOrphans.
@@ -203,6 +204,9 @@ func (s *stubProv) IsRecentlyDestroyed(int, time.Duration) bool { return false }
 func (s *stubProv) QuarantineVMID(int)                          {}
 func (s *stubProv) IsVMIDQuarantined(int) bool                  { return false }
 func (s *stubProv) InFlightCloneCount() int                     { return 0 }
+func (s *stubProv) CountUnpooledRunnerVMs(context.Context, []*provisioner.VM) (int, error) {
+	return s.unpooled, nil
+}
 
 func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -220,6 +224,8 @@ func baseCfg() Config {
 		OrphanGrace:                60 * time.Second,
 		RunnerNamePrefix:           "gh-runner-test-",
 		ScaleSetName:               "test",
+		VMIDMin:                    900,
+		VMIDMax:                    999,
 	}
 }
 
@@ -827,7 +833,8 @@ func TestSweepProxmoxOrphans_RespectsOrphanGrace(t *testing.T) {
 		owned: []*provisioner.VM{{VMID: 4001, Node: "pve1", Name: "gh-runner-test-4001"}},
 	}
 	mgr := &fakeManager{rows: nil}
-	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), nil)
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), metrics)
 	require.NoError(t, err)
 
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -872,7 +879,8 @@ func TestSweepProxmoxOrphans_PreservesEntryWhenDestroyFails(t *testing.T) {
 		destroyErr: errors.New("transient PVE failure"),
 	}
 	mgr := &fakeManager{rows: nil}
-	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), nil)
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	r, err := New(baseCfg(), newTestClient(t, srv), mgr, prov, silentLogger(), metrics)
 	require.NoError(t, err)
 
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -886,6 +894,7 @@ func TestSweepProxmoxOrphans_PreservesEntryWhenDestroyFails(t *testing.T) {
 	r.now = func() time.Time { return t0.Add(baseCfg().OrphanGrace + time.Second) }
 	require.NoError(t, r.Tick(context.Background()))
 	require.Equal(t, []int{4003}, prov.destroys, "destroy must have been attempted")
+	require.Equal(t, 1.0, testutil.ToFloat64(metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1")))
 	require.Contains(t, r.orphanProxmoxFirstSeen, 4003,
 		"a failed destroy must NOT delete the first-seen entry — the next tick should retry")
 
@@ -898,6 +907,19 @@ func TestSweepProxmoxOrphans_PreservesEntryWhenDestroyFails(t *testing.T) {
 	require.Equal(t, []int{4003, 4003}, prov.destroys, "the next tick must retry the destroy")
 	require.NotContains(t, r.orphanProxmoxFirstSeen, 4003,
 		"after a successful destroy the first-seen entry is cleared")
+}
+
+func TestSweepProxmoxOrphans_ExportsUnpooledRunnerGauge(t *testing.T) {
+	t.Parallel()
+	srv := runnersServer(t, nil)
+	defer srv.Close()
+	metrics := observability.NewMetrics(prometheus.NewRegistry())
+	r, err := New(baseCfg(), newTestClient(t, srv), &fakeManager{},
+		&stubProv{unpooled: 2}, silentLogger(), metrics)
+	require.NoError(t, err)
+
+	r.sweepProxmoxOrphans(context.Background(), nil)
+	require.Equal(t, 2.0, testutil.ToFloat64(metrics.UnpooledRunnerVMs.WithLabelValues("test")))
 }
 
 // TestSweepProxmoxOrphans_ClearsEntryWhenVMReappearsInStore: when the
