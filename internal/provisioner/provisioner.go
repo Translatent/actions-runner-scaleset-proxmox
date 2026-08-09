@@ -760,7 +760,8 @@ func (p *pmox) requireDestructiveOwnership(ctx context.Context, pVM *proxmox.Vir
 		return fmt.Errorf("read ownership pool %q: %w", p.poolID, err)
 	}
 	for _, member := range pool.Members {
-		if int(member.VMID) == vmid {
+		memberVMID := int(member.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
+		if memberVMID == vmid {
 			return nil
 		}
 	}
@@ -768,7 +769,8 @@ func (p *pmox) requireDestructiveOwnership(ctx context.Context, pVM *proxmox.Vir
 	if cluster, clusterErr := p.cli.Cluster(ctx); clusterErr == nil {
 		if resources, resourcesErr := cluster.Resources(ctx, "vm"); resourcesErr == nil {
 			for _, resource := range resources {
-				if int(resource.VMID) == vmid {
+				resourceVMID := int(resource.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
+				if resourceVMID == vmid {
 					observedPool = resource.Pool
 					break
 				}
@@ -959,7 +961,8 @@ func (p *pmox) ListOwnedVMs(ctx context.Context) ([]*VM, error) {
 	out := make([]*VM, 0, len(pool.Members))
 	for _, member := range pool.Members {
 		out = append(out, &VM{
-			VMID: int(member.VMID), Node: member.Node, Name: member.Name,
+			VMID: int(member.VMID), // #nosec G115 -- Proxmox VMIDs are bounded integers.
+			Node: member.Node, Name: member.Name,
 			Profile: tags.ProfileOf(member.Tags),
 		})
 	}
@@ -975,7 +978,8 @@ func (p *pmox) CountUnpooledRunnerVMs(ctx context.Context, candidates []*VM) (in
 	}
 	members := make(map[int]struct{}, len(pool.Members))
 	for _, member := range pool.Members {
-		members[int(member.VMID)] = struct{}{}
+		memberVMID := int(member.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
+		members[memberVMID] = struct{}{}
 	}
 	count := 0
 	for _, candidate := range candidates {

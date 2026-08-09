@@ -240,6 +240,7 @@ func Start(t testing.TB, opts Options) *Harness {
 		ProxmoxURL:           proxmox.URL,
 		Org:                  opts.Org,
 		ScaleSetName:         opts.ScaleSetName,
+		ResourcePool:         "e2e-pool",
 		HotSize:              opts.HotSize,
 		WarmSize:             opts.WarmSize,
 		MaxConcurrentRunners: opts.MaxConcurrentRunners,
@@ -256,6 +257,7 @@ func Start(t testing.TB, opts Options) *Harness {
 		for i, ss := range opts.Scalesets {
 			cv.Scalesets = append(cv.Scalesets, scalesetCfg{
 				Name:                 ss.Name,
+				Pool:                 fmt.Sprintf("e2e-pool-%d", i),
 				Org:                  ss.Org,
 				HotSize:              ss.HotSize,
 				WarmSize:             ss.WarmSize,
@@ -449,6 +451,7 @@ type configValues struct {
 	ProxmoxURL           string
 	Org                  string
 	ScaleSetName         string
+	ResourcePool         string
 	HotSize              int
 	WarmSize             int
 	MaxConcurrentRunners int
@@ -479,6 +482,7 @@ type configValues struct {
 // orchestrator's config.Scalesets schema expects.
 type scalesetCfg struct {
 	Name                 string
+	Pool                 string
 	Org                  string
 	HotSize              int
 	WarmSize             int
@@ -512,6 +516,7 @@ github:
 scalesets:
 {{- range .Scalesets }}
   - name: {{.Name}}
+    pool: {{.Pool}}
     labels: [self-hosted, linux, x64, e2e]
     runner_group: default
     max_concurrent_runners: {{.MaxConcurrentRunners}}
@@ -528,6 +533,7 @@ scalesets:
 {{- else }}
 scaleset:
   name: {{.ScaleSetName}}
+  pool: {{.ResourcePool}}
   labels: [self-hosted, linux, x64, e2e]
   runner_group: default
   max_concurrent_runners: {{.MaxConcurrentRunners}}
