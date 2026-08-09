@@ -86,7 +86,7 @@ See `quotas:` and `priority:` in [config.example.yaml](config.example.yaml) for 
 | `internal/provisioner` | Proxmox client wrapper + JIT injection |
 | `internal/nodeselector` | Cluster node placement strategies (`single` / `round_robin` / `least_loaded`) |
 | `internal/store` | In-memory state via `hashicorp/go-memdb` |
-| `internal/tags` | Proxmox tag schema identifying VMs owned by this scale set |
+| `internal/tags` | Proxmox metadata tags for profile/template routing and diagnostics |
 | `internal/gh` | GitHub REST reconciler — backstop for missed listener callbacks; orphan sweeps |
 | `internal/adminapi` | Token-protected admin HTTP API (state, drain, force-destroy) |
 | `internal/observability` | Structured logging, Prometheus metrics, OTLP/HTTP tracing, health probes |
