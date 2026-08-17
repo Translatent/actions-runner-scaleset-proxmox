@@ -7,16 +7,6 @@ on:
       - "Release"
     types: [completed]
     branches: [main, ci-failure-report-e2e]
-  schedule:
-    - cron: "22 7 * * *"
-  workflow_dispatch:
-    inputs:
-      self_test_failure:
-        description: Deliberately fail the credential probe and exercise the durable issue path.
-        required: false
-        default: false
-        type: boolean
-
 permissions:
   actions: read
   contents: read
@@ -35,13 +25,5 @@ jobs:
       run_id: ${{ github.event.workflow_run.id }}
       run_url: ${{ github.event.workflow_run.html_url }}
       conclusion: ${{ github.event.workflow_run.conclusion }}
-    secrets:
-      FORGE_ANOMALY_TOKEN: ${{ secrets.FORGE_ANOMALY_TOKEN }}
-
-  health:
-    if: github.event_name != 'workflow_run'
-    uses: ./.github/workflows/check-ci-failure-reporter.yml
-    with:
-      force_failure: ${{ inputs.self_test_failure || false }}
     secrets:
       FORGE_ANOMALY_TOKEN: ${{ secrets.FORGE_ANOMALY_TOKEN }}
