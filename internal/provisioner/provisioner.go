@@ -49,6 +49,12 @@ var (
 	// Destroy/Stop treat this as idempotent success.
 	ErrVMNotFound = errors.New("provisioner: vm not found")
 
+	// ErrVMAccessDenied means go-proxmox returned its typed
+	// ErrNotAuthorized sentinel while resolving a VM. Destroy may treat
+	// this as terminal only after a separate ownership-pool read proves
+	// the VMID is not a current member; every other caller must surface it.
+	ErrVMAccessDenied = errors.New("provisioner: vm access denied")
+
 	// ErrVMAlreadyRunning is returned by Start when the VM is already
 	// powered on. The caller's desired post-condition is already met.
 	ErrVMAlreadyRunning = errors.New("provisioner: vm already running")
@@ -96,6 +102,27 @@ type VM struct {
 	Node    string
 	Name    string
 	Profile string
+}
+
+// DestroyOutcome identifies an idempotent terminal result classified by its
+// reason. The empty value means a VM was deleted normally.
+// Keep this enum closed: it is exported as the bounded `reason` label on
+// scaleset_destroy_terminal_total by the pool manager.
+type DestroyOutcome string
+
+const (
+	// DestroyOutcomeNotFound means the VM was already absent.
+	DestroyOutcomeNotFound DestroyOutcome = "not_found"
+	// DestroyOutcomeAccessDenied means lookup was denied and the VMID was
+	// independently proven absent from the ownership pool.
+	DestroyOutcomeAccessDenied DestroyOutcome = "access_denied"
+)
+
+// DestroyOutcomeProvisioner is the outcome-aware destroy surface used by the
+// pool manager. Provisioner.Destroy remains the compatibility surface for
+// callers that only need idempotent success/failure semantics.
+type DestroyOutcomeProvisioner interface {
+	DestroyWithOutcome(ctx context.Context, vm *VM) (DestroyOutcome, error)
 }
 
 // CloneOptions are passed to [Provisioner.Clone]. NewVMID is allocated by
@@ -755,15 +782,12 @@ func (p *pmox) Stop(ctx context.Context, vm *VM) error {
 
 func (p *pmox) requireDestructiveOwnership(ctx context.Context, pVM *proxmox.VirtualMachine) error {
 	vmid := int(pVM.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
-	pool, err := p.cli.Pool(ctx, p.poolID, "qemu")
+	member, err := p.isOwnershipPoolMember(ctx, vmid)
 	if err != nil {
-		return fmt.Errorf("read ownership pool %q: %w", p.poolID, err)
+		return err
 	}
-	for _, member := range pool.Members {
-		memberVMID := int(member.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
-		if memberVMID == vmid {
-			return nil
-		}
+	if member {
+		return nil
 	}
 	observedPool := ""
 	if cluster, clusterErr := p.cli.Cluster(ctx); clusterErr == nil {
@@ -782,6 +806,23 @@ func (p *pmox) requireDestructiveOwnership(ctx context.Context, pVM *proxmox.Vir
 		VMID: vmid, Node: pVM.Node, Name: pVM.Name, Tags: pVM.Tags,
 		Pool: observedPool, ExpectedPool: p.poolID,
 	}
+}
+
+// isOwnershipPoolMember is the single authoritative membership read used by
+// both the ordinary destructive-ownership gate and the access-denied lookup
+// path. Membership is ownership; VM names and tags are metadata only.
+func (p *pmox) isOwnershipPoolMember(ctx context.Context, vmid int) (bool, error) {
+	pool, err := p.cli.Pool(ctx, p.poolID, "qemu")
+	if err != nil {
+		return false, fmt.Errorf("read ownership pool %q: %w", p.poolID, err)
+	}
+	for _, member := range pool.Members {
+		memberVMID := int(member.VMID) // #nosec G115 -- Proxmox VMIDs are bounded integers.
+		if memberVMID == vmid {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // stopInternal does the graceful-then-hard stop with an already-resolved
@@ -816,19 +857,25 @@ func (p *pmox) stopInternal(ctx context.Context, pVM *proxmox.VirtualMachine) er
 	return nil
 }
 
-// Destroy stops (if needed) and deletes a VM. Idempotent: a missing VM is
-// treated as success.
+// Destroy stops (if needed) and deletes a VM. Idempotent terminal outcomes are
+// returned as success; use DestroyWithOutcome when the caller needs to count
+// why no ordinary delete task ran.
 func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
+	_, err := p.DestroyWithOutcome(ctx, vm)
+	return err
+}
+
+// DestroyWithOutcome is Destroy plus a closed terminal-outcome result. A
+// permission denial is terminal only when the independent ownership-pool read
+// proves the VMID is outside the pool. A denial for a current member remains a
+// hard error, preserving genuine ACL-regression visibility.
+func (p *pmox) DestroyWithOutcome(ctx context.Context, vm *VM) (DestroyOutcome, error) {
 	pVM, err := p.getVM(ctx, vm)
 	if err != nil {
-		if isNotFound(err) {
-			p.inFlightClones.Delete(vm.VMID)
-			return nil
-		}
-		return err
+		return p.destroyLookupOutcome(ctx, vm, err)
 	}
 	if err := p.requireDestructiveOwnership(ctx, pVM); err != nil {
-		return err
+		return "", err
 	}
 	// Reuse the resolved handle for the stop step — Destroy is on the
 	// hot drain path so an extra round trip per VM matters at scale.
@@ -841,7 +888,7 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	// create those ISOs today, but preserving the library behaviour here keeps
 	// a future CloudInit caller from trading the disk leak for an ISO leak.
 	if err := p.deleteCloudInitISO(ctx, pVM); err != nil {
-		return fmt.Errorf("delete cloud-init iso: %w", classifyProxmoxError(err))
+		return "", fmt.Errorf("delete cloud-init iso: %w", classifyProxmoxError(err))
 	}
 
 	params := url.Values{}
@@ -853,9 +900,9 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	if err != nil {
 		if isNotFound(err) {
 			p.inFlightClones.Delete(vm.VMID)
-			return nil
+			return DestroyOutcomeNotFound, nil
 		}
-		return fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
+		return "", fmt.Errorf("delete vm: %w", classifyProxmoxError(err))
 	}
 	task := proxmox.NewTask(upid, p.cli)
 	if err := awaitTask(ctx, task, 120); err != nil {
@@ -865,9 +912,9 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 		if errors.Is(classified, ErrVMNotFound) {
 			p.inFlightClones.Delete(vm.VMID)
 			p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
-			return nil
+			return DestroyOutcomeNotFound, nil
 		}
-		return fmt.Errorf("await delete: %w", classified)
+		return "", fmt.Errorf("await delete: %w", classified)
 	}
 	p.inFlightClones.Delete(vm.VMID)
 	// PVE has finished the qmdestroy task. Record the timestamp so the
@@ -876,7 +923,31 @@ func (p *pmox) Destroy(ctx context.Context, vm *VM) error {
 	// would race PVE-side lock-file cleanup and produce
 	// "VM N is running - destroy failed" errors.
 	p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
-	return nil
+	return "", nil
+}
+
+// destroyLookupOutcome classifies a getVM failure and applies the pool
+// membership safety guard required for permission denials. Kept separate from
+// DestroyWithOutcome so the otherwise-unreproducible 403 branch can be tested
+// deterministically without manufacturing a live ACL failure.
+func (p *pmox) destroyLookupOutcome(ctx context.Context, vm *VM, err error) (DestroyOutcome, error) {
+	classified := classifyProxmoxError(err)
+	if errors.Is(classified, ErrVMNotFound) {
+		p.inFlightClones.Delete(vm.VMID)
+		return DestroyOutcomeNotFound, nil
+	}
+	if !errors.Is(classified, ErrVMAccessDenied) {
+		return "", err
+	}
+	member, membershipErr := p.isOwnershipPoolMember(ctx, vm.VMID)
+	if membershipErr != nil {
+		return "", fmt.Errorf("verify ownership after access denial for vm %d: %w", vm.VMID, membershipErr)
+	}
+	if !member {
+		p.inFlightClones.Delete(vm.VMID)
+		return DestroyOutcomeAccessDenied, nil
+	}
+	return "", fmt.Errorf("destroy vm %d: access denied for current ownership-pool member: %w", vm.VMID, classified)
 }
 
 // deleteCloudInitISO mirrors go-proxmox VirtualMachine.Delete's private
@@ -1018,6 +1089,9 @@ func classifyTypedError(err error) (bool, error) {
 	if errors.Is(err, proxmox.ErrNotFound) {
 		return true, fmt.Errorf("%w: %w", ErrVMNotFound, err)
 	}
+	if errors.Is(err, proxmox.ErrNotAuthorized) {
+		return true, fmt.Errorf("%w: %w", ErrVMAccessDenied, err)
+	}
 	return false, nil
 }
 
@@ -1096,32 +1170,24 @@ func classifyProxmoxError(err error) error {
 
 // httpStatusFromError extracts an HTTP status code from a go-proxmox
 // error formatted as "%d Status Text" (e.g. "500 Internal Server
-// Error", "404 Not Found"). Returns 0 if no recognisable status prefix
-// is present.
+// Error", "404 Not Found"). Each error in the unwrap chain is inspected
+// so a canonical status prefix survives contextual wrappers such as getVM's
+// "get vm ..." prefix. Returns 0 if no recognisable status is present.
 func httpStatusFromError(err error) int {
-	if err == nil {
-		return 0
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		s := current.Error()
+		if len(s) < 3 || s[0] < '0' || s[0] > '9' || s[1] < '0' || s[1] > '9' || s[2] < '0' || s[2] > '9' {
+			continue
+		}
+		if len(s) > 3 && s[3] != ' ' {
+			continue
+		}
+		n, perr := strconv.Atoi(s[:3])
+		if perr == nil && n >= 100 && n <= 599 {
+			return n
+		}
 	}
-	s := err.Error()
-	// Pull the leading number out of the canonical "NNN Status..." format.
-	// We avoid a full regex to keep this hot path cheap.
-	end := 0
-	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
-		end++
-	}
-	// HTTP status codes are exactly 3 digits and (when followed by more
-	// text) must be followed by a space.
-	if end != 3 || (end < len(s) && s[end] != ' ') {
-		return 0
-	}
-	n, perr := strconv.Atoi(s[:end])
-	if perr != nil {
-		return 0
-	}
-	if n < 100 || n > 599 {
-		return 0
-	}
-	return n
+	return 0
 }
 
 // isNotFound is kept as a thin adapter so internal call sites (Stop,

@@ -398,6 +398,12 @@ func NewManager(cfg Config, st *store.Store, prov provisioner.Provisioner, sel n
 		powerPollErrLastLog: make(map[int]time.Time),
 		now:                 time.Now,
 	}
+	if metrics != nil {
+		// Pre-create both members of the closed terminal-reason enum so the
+		// series are visible at zero and alerting never depends on a first hit.
+		metrics.DestroyTerminal.WithLabelValues(cfg.ScaleSetName, string(provisioner.DestroyOutcomeAccessDenied)).Add(0)
+		metrics.DestroyTerminal.WithLabelValues(cfg.ScaleSetName, string(provisioner.DestroyOutcomeNotFound)).Add(0)
+	}
 	for _, p := range cfg.Profiles {
 		ps := &profileState{
 			settings: p,
@@ -2176,13 +2182,15 @@ func (m *manager) destroyOrSyncFallback(vmid int, node, profile string) {
 		"vmid", vmid, "node", node)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if err := m.prov.Destroy(ctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
+	outcome, err := m.destroyVM(ctx, vmid, node)
+	if err != nil {
 		if m.abandonOwnershipMismatch(vmid, node, "clone-fail-sync", err) {
 			return
 		}
 		m.log.Warn("clone-fail destroy: synchronous fallback failed; vm may leak", "vmid", vmid, "err", err)
 		return
 	}
+	m.recordDestroyTerminal(outcome)
 	if err := m.store.Delete(vmid); err != nil {
 		m.log.Warn("clone-fail destroy: row delete failed after sync destroy", "vmid", vmid, "err", err)
 	}
@@ -2207,7 +2215,8 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 	))
 	defer span.End()
 
-	if err := m.prov.Destroy(dctx, &provisioner.VM{VMID: vmid, Node: node}); err != nil {
+	outcome, err := m.destroyVM(dctx, vmid, node)
+	if err != nil {
 		if m.abandonOwnershipMismatch(vmid, node, "destroy", err) {
 			return
 		}
@@ -2222,6 +2231,10 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 		m.metrics.RecordProxmoxError(m.cfg.ScaleSetName, "destroy", node)
 		m.log.Warn("destroy: provisioner failed", "vmid", vmid, "err", err)
 		return
+	}
+	if outcome != "" {
+		m.recordDestroyTerminal(outcome)
+		m.log.Info("destroy: terminal outcome", "vmid", vmid, "reason", outcome)
 	}
 	// Delete the row and capture its runner_id in the same write txn.
 	// A separate Get-then-Delete would race with concurrent
@@ -2275,6 +2288,35 @@ func (m *manager) destroy(ctx context.Context, vmid int, node string) {
 		} else {
 			m.log.Debug("destroy: deregistered github runner", "vmid", vmid, "runner_id", runnerID)
 		}
+	}
+}
+
+// destroyVM uses the outcome-aware provisioner surface when available. The
+// compatibility fallback keeps test and alternate provisioners source-stable;
+// production's pmox implementation always exposes DestroyWithOutcome.
+func (m *manager) destroyVM(ctx context.Context, vmid int, node string) (provisioner.DestroyOutcome, error) {
+	vm := &provisioner.VM{VMID: vmid, Node: node}
+	if outcomeProv, ok := m.prov.(provisioner.DestroyOutcomeProvisioner); ok {
+		return outcomeProv.DestroyWithOutcome(ctx, vm)
+	}
+	return "", m.prov.Destroy(ctx, vm)
+}
+
+// recordDestroyTerminal deliberately switches over the two closed enum
+// members instead of passing arbitrary strings into a Prometheus label.
+func (m *manager) recordDestroyTerminal(outcome provisioner.DestroyOutcome) {
+	if m.metrics == nil {
+		return
+	}
+	switch outcome {
+	case provisioner.DestroyOutcomeAccessDenied:
+		m.metrics.DestroyTerminal.WithLabelValues(m.cfg.ScaleSetName, "access_denied").Inc()
+	case provisioner.DestroyOutcomeNotFound:
+		m.metrics.DestroyTerminal.WithLabelValues(m.cfg.ScaleSetName, "not_found").Inc()
+	case "":
+		return
+	default:
+		m.log.Warn("destroy: ignored unknown terminal outcome", "outcome", outcome)
 	}
 }
 

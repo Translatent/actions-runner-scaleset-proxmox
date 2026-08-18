@@ -114,6 +114,11 @@ type Metrics struct {
 	// dispatcher queue. The bound is 2 * the destroy semaphore cap.
 	PoolDestroyBacklogDepth *prometheus.GaugeVec
 
+	// DestroyTerminal counts idempotent terminal destroy outcomes. `reason`
+	// is a closed enum populated only with "access_denied" and "not_found"
+	// by the pool manager.
+	DestroyTerminal *prometheus.CounterVec
+
 	// PanicsRecovered counts panics caught by the pool's async
 	// worker recover() guards. Each increment indicates a real bug
 	// in a worker goroutine that the recover prevented from
@@ -326,6 +331,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Namespace: ns, Name: "pool_destroy_backlog_depth",
 			Help: "Current depth of the pool destroy dispatcher queue, by scaleset.",
 		}, []string{"scaleset"}),
+		DestroyTerminal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: ns, Name: "destroy_terminal_total",
+			Help: "Idempotent terminal destroy outcomes, partitioned by reason.",
+		}, []string{"scaleset", "reason"}),
 		PanicsRecovered: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: ns, Name: "panics_recovered_total",
 			Help: "Panics caught by the pool's async worker recover() guards, by operation. Non-zero rate indicates a real bug — alert on rate(panics_recovered_total[5m]) > 0.",
@@ -340,6 +349,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.QuotaThrottled, m.PriorityAcquires, m.Preemptions, m.CanaryReverts,
 		m.ScheduleFires, m.ScheduleActive, m.UnpooledRunnerVMs,
 		m.PoolDestroyBacklogFull, m.PoolDestroyBacklogDepth,
+		m.DestroyTerminal,
 		m.PanicsRecovered,
 		m.Leader,
 	)

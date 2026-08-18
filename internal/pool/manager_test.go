@@ -44,6 +44,10 @@ type fakeProv struct {
 	// When set, it takes precedence over destroyErr.
 	destroyErrFor map[int]error
 
+	// destroyOutcomeFor drives the outcome-aware production destroy surface.
+	// Entries are returned only when the corresponding Destroy call succeeds.
+	destroyOutcomeFor map[int]provisioner.DestroyOutcome
+
 	// destroyHang, when true, makes Destroy block until ctx is cancelled
 	// — a model of the real provisioner getting stuck on an unreachable
 	// Proxmox node. The fake returns ctx.Err once cancellation arrives.
@@ -168,6 +172,15 @@ func (f *fakeProv) Destroy(ctx context.Context, v *provisioner.VM) error {
 		f.QuarantineVMID(v.VMID)
 	}
 	return f.destroyErr
+}
+
+func (f *fakeProv) DestroyWithOutcome(ctx context.Context, v *provisioner.VM) (provisioner.DestroyOutcome, error) {
+	if err := f.Destroy(ctx, v); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.destroyOutcomeFor[v.VMID], nil
 }
 
 func (f *fakeProv) WaitReady(_ context.Context, _ *provisioner.VM, _ time.Duration) error {
@@ -642,6 +655,84 @@ func TestForceDestroy_ForeignOwnershipMismatchAbandonsRowAndQuarantines(t *testi
 		"ownership mismatch must abandon the row after one gated provisioner call")
 	after := testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1"))
 	require.Equal(t, before+1, after, "ownership refusal is a destroy failure and must be metered")
+}
+
+func TestForceDestroy_AccessDeniedOutsidePoolTerminatesAndDeletesRow(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedHot(t, st, 1)
+	fp := &fakeProv{destroyOutcomeFor: map[int]provisioner.DestroyOutcome{
+		20000: provisioner.DestroyOutcomeAccessDenied,
+	}}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
+	before := testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "access_denied"))
+
+	require.NoError(t, mgr.ForceDestroy(context.Background(), 20000, "outside pool"))
+	require.Eventually(t, func() bool {
+		_, err := st.Get(20000)
+		return errors.Is(err, store.ErrNotFound)
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, before+1,
+		testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "access_denied")))
+}
+
+func TestForceDestroy_AccessDeniedCurrentPoolMemberRemainsHardFailure(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedHot(t, st, 1)
+	fp := &fakeProv{destroyErrFor: map[int]error{
+		20000: fmt.Errorf("current ownership-pool member: %w", provisioner.ErrVMAccessDenied),
+	}}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
+	terminalBefore := testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "access_denied"))
+	errorBefore := testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1"))
+
+	require.NoError(t, mgr.ForceDestroy(context.Background(), 20000, "acl regression"))
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(mgr.metrics.ProxmoxErrors.WithLabelValues("test", "destroy", "pve1")) == errorBefore+1
+	}, time.Second, 10*time.Millisecond)
+	row, err := st.Get(20000)
+	require.NoError(t, err, "a current-member permission denial must stay retryable and loud")
+	require.Equal(t, store.StateDraining, row.State)
+	require.Equal(t, terminalBefore,
+		testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "access_denied")))
+}
+
+func TestForceDestroy_NotFoundTerminatesWithBoundedMetric(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedHot(t, st, 1)
+	fp := &fakeProv{destroyOutcomeFor: map[int]provisioner.DestroyOutcome{
+		20000: provisioner.DestroyOutcomeNotFound,
+	}}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
+	before := testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "not_found"))
+
+	require.NoError(t, mgr.ForceDestroy(context.Background(), 20000, "already absent"))
+	require.Eventually(t, func() bool {
+		_, err := st.Get(20000)
+		return errors.Is(err, store.ErrNotFound)
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, before+1,
+		testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "not_found")))
+}
+
+func TestCloneFailureSyncCleanup_AccessDeniedOutsidePoolDeletesRow(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedHot(t, st, 1)
+	fp := &fakeProv{destroyOutcomeFor: map[int]provisioner.DestroyOutcome{
+		20000: provisioner.DestroyOutcomeAccessDenied,
+	}}
+	mgr := newTestManager(t, st, fp, Config{HotSize: 1})
+	mgr.workerCancel() // force the failed-clone synchronous fallback branch
+	before := testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "access_denied"))
+
+	mgr.destroyOrSyncFallback(20000, "pve1", defaultProfileName)
+	_, err := st.Get(20000)
+	require.ErrorIs(t, err, store.ErrNotFound)
+	require.Equal(t, before+1,
+		testutil.ToFloat64(mgr.metrics.DestroyTerminal.WithLabelValues("test", "access_denied")))
 }
 
 func TestSweepStuckRows_StuckRowMaxAge(t *testing.T) {

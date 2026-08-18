@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -496,6 +497,7 @@ func TestClassifyProxmoxError(t *testing.T) {
 	}{
 		{"nil", nil, nil},
 		{"library ErrNotFound", proxmox.ErrNotFound, ErrVMNotFound},
+		{"library ErrNotAuthorized", proxmox.ErrNotAuthorized, ErrVMAccessDenied},
 		{"404 status prefix", &stringError{"404 Not Found"}, ErrVMNotFound},
 		{"body says does not exist", &stringError{"Configuration file 'nodes/pve1/qemu-server/10042.conf' does not exist"}, ErrVMNotFound},
 		{"already running", &stringError{"VM 10042 already running"}, ErrVMAlreadyRunning},
@@ -522,6 +524,15 @@ func TestClassifyProxmoxError(t *testing.T) {
 	}
 }
 
+func TestClassifyProxmoxError_AccessDeniedThroughGetVMWrapper(t *testing.T) {
+	t.Parallel()
+	wrapped := fmt.Errorf("get vm 10042 on pve1: %w", proxmox.ErrNotAuthorized)
+	got := classifyProxmoxError(wrapped)
+	require.NotEqual(t, wrapped, got, "the typed classifier must classify the wrapped sentinel")
+	require.ErrorIs(t, got, ErrVMAccessDenied)
+	require.ErrorIs(t, got, proxmox.ErrNotAuthorized, "classification must retain the library sentinel")
+}
+
 // TestClassifiers_Isolated exercises each detection strategy on its
 // own so a regression in one layer surfaces independently from the
 // others. The full-pipeline coverage stays in TestClassifyProxmoxError.
@@ -533,6 +544,12 @@ func TestClassifiers_Isolated(t *testing.T) {
 		require.True(t, ok)
 		require.ErrorIs(t, got, ErrVMNotFound)
 	})
+	t.Run("typed access-denied sentinel hit", func(t *testing.T) {
+		t.Parallel()
+		ok, got := classifyTypedError(proxmox.ErrNotAuthorized)
+		require.True(t, ok)
+		require.ErrorIs(t, got, ErrVMAccessDenied)
+	})
 	t.Run("typed sentinel miss leaves error untouched", func(t *testing.T) {
 		t.Parallel()
 		ok, _ := classifyTypedError(&stringError{"404 Not Found"})
@@ -541,6 +558,13 @@ func TestClassifiers_Isolated(t *testing.T) {
 	t.Run("http status hit", func(t *testing.T) {
 		t.Parallel()
 		ok, got := classifyByHTTPStatus(&stringError{"404 Not Found"})
+		require.True(t, ok)
+		require.ErrorIs(t, got, ErrVMNotFound)
+	})
+	t.Run("http status hit through getVM wrapper with typed classifier bypassed", func(t *testing.T) {
+		t.Parallel()
+		wrapped := fmt.Errorf("get vm 10042 on pve1: %w", &stringError{"404 Not Found"})
+		ok, got := classifyByHTTPStatus(wrapped)
 		require.True(t, ok)
 		require.ErrorIs(t, got, ErrVMNotFound)
 	})
@@ -568,11 +592,45 @@ func TestClassifiers_Isolated(t *testing.T) {
 	})
 }
 
+func TestDestroyLookupOutcome_AccessDeniedRequiresOutsidePool(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		pool        string
+		wantOutcome DestroyOutcome
+		wantErr     bool
+	}{
+		{name: "outside ownership pool is terminal", pool: "", wantOutcome: DestroyOutcomeAccessDenied},
+		{name: "current pool member remains hard failure", pool: "test-pool", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fp := fakeproxmox.New(t, fakeproxmox.Options{})
+			fp.SeedVM("pve1", 10042, "gh-runner-test-scaleset-10042", true, nil)
+			fp.SetVMPool(10042, tc.pool)
+			p := newTestProvisioner(t, fp.Server, "pve1")
+
+			wrapped := fmt.Errorf("get vm 10042 on pve1: %w", proxmox.ErrNotAuthorized)
+			outcome, err := p.destroyLookupOutcome(context.Background(), &VM{VMID: 10042, Node: "pve1"}, wrapped)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.ErrorIs(t, err, ErrVMAccessDenied)
+				require.Empty(t, outcome)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantOutcome, outcome)
+		})
+	}
+}
+
 // TestHttpStatusFromError exercises the leading-NNN parser used as a
 // fallback detection layer.
 func TestHttpStatusFromError(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, 404, httpStatusFromError(&stringError{"404 Not Found"}))
+	require.Equal(t, 404, httpStatusFromError(fmt.Errorf("get vm 10042 on pve1: %w", &stringError{"404 Not Found"})),
+		"the status classifier must see a canonical status token through getVM's wrapper")
 	require.Equal(t, 500, httpStatusFromError(&stringError{"500 Internal Server Error: details"}))
 	require.Equal(t, 0, httpStatusFromError(&stringError{"4xx error"}))
 	require.Equal(t, 0, httpStatusFromError(&stringError{"no status here"}))
