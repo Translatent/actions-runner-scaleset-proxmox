@@ -20,6 +20,14 @@ on:
       conclusion:
         required: true
         type: string
+      trigger_event:
+        required: false
+        default: ""
+        type: string
+      display_title:
+        required: false
+        default: ""
+        type: string
       head_branch:
         required: true
         type: string
@@ -60,6 +68,8 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           RUN_URL: ${{ inputs.run_url }}
           CONCLUSION: ${{ inputs.conclusion }}
+          TRIGGER_EVENT: ${{ inputs.trigger_event }}
+          DISPLAY_TITLE: ${{ inputs.display_title }}
           HEAD_BRANCH: ${{ inputs.head_branch }}
           HEAD_SHA: ${{ inputs.head_sha }}
           LOG_TAIL: ${{ steps.logs.outputs.log-tail }}
@@ -77,7 +87,14 @@ jobs:
             '{service:$service,digest:$digest,anomaly_class:"ci_failure",health_snapshot:$snapshot,log_tail:$log_tail,branch:$branch,head_sha:$head_sha}')"
           jq -e --arg branch "$HEAD_BRANCH" --arg head_sha "$HEAD_SHA" \
             '.branch == $branch and .head_sha == $head_sha and (.log_tail | length) > 0' <<<"$payload" >/dev/null
-          if [ "$HEAD_BRANCH" == main ]; then
+          should_report_ci_failure() {
+            [ "$HEAD_BRANCH" = main ] || return 1
+            if [ "$TRIGGER_EVENT" = workflow_dispatch ] && [[ "$DISPLAY_TITLE" == forge-verify/* ]]; then
+              return 1
+            fi
+            return 0
+          }
+          if should_report_ci_failure; then
             response="$(curl --fail-with-body --silent --show-error \
               --config <(printf 'header = "Cookie: translatent_session=%s"\n' "$FORGE_ANOMALY_TOKEN") \
               -H 'Content-Type: application/json' \

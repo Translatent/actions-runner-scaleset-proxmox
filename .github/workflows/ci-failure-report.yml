@@ -27,6 +27,8 @@ jobs:
       run_id: ${{ github.event.workflow_run.id }}
       run_url: ${{ github.event.workflow_run.html_url }}
       conclusion: ${{ github.event.workflow_run.conclusion }}
+      trigger_event: ${{ github.event.workflow_run.event }}
+      display_title: ${{ github.event.workflow_run.display_title }}
       head_branch: ${{ github.event.workflow_run.head_branch }}
       head_sha: ${{ github.event.workflow_run.head_sha }}
     secrets:
