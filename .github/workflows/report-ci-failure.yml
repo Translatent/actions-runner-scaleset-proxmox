@@ -20,6 +20,12 @@ on:
       conclusion:
         required: true
         type: string
+      head_branch:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
     secrets:
       FORGE_ANOMALY_TOKEN:
         required: true
@@ -34,6 +40,16 @@ jobs:
     # The reporter must not share the Linux scaleset whose failures it reports.
     runs-on: ubuntu-latest
     steps:
+      - name: Check out reporter implementation
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Collect failed job logs
+        id: logs
+        continue-on-error: true
+        uses: ./.github/actions/collect-ci-failure-logs
+        with:
+          token: ${{ github.token }}
+          repo: ${{ inputs.repo }}
+          run-id: ${{ inputs.run_id }}
       - name: Report failed main workflow
         id: report
         continue-on-error: true
@@ -44,43 +60,34 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           RUN_URL: ${{ inputs.run_url }}
           CONCLUSION: ${{ inputs.conclusion }}
+          HEAD_BRANCH: ${{ inputs.head_branch }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          LOG_TAIL: ${{ steps.logs.outputs.log-tail }}
           FORGE_ANOMALY_TOKEN: ${{ secrets.FORGE_ANOMALY_TOKEN }}
         run: |
           set -euo pipefail
-          jobs="$(curl --fail-with-body --silent --show-error \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
-          failed_jobs="$(jq -r '[.jobs[] | select(.conclusion == "failure") | .name] | if length == 0 then ["workflow failed without a failed job"] else . end | join("\n")' <<<"$jobs")"
-          log_tail="$(printf 'Failed jobs:\n%s' "$failed_jobs")"
-          failed_job_count="$(jq '[.jobs[] | select(.conclusion == "failure")] | length' <<<"$jobs")"
-          if [ "$failed_job_count" -gt 0 ]; then
-            while IFS= read -r failed_job; do
-              job_id="$(jq -r '.id' <<<"$failed_job")"
-              job_name="$(jq -r '.name' <<<"$failed_job")"
-              job_log="$(curl -L --fail-with-body --silent --show-error \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H 'Accept: application/vnd.github+json' \
-                -H 'X-GitHub-Api-Version: 2022-11-28' \
-                "https://api.github.com/repos/$REPO/actions/jobs/$job_id/logs" || true)"
-              printf -v log_tail '%s\n\n=== %s (last 150 lines) ===\n%s' \
-                "$log_tail" "$job_name" "$(tail -n 150 <<<"$job_log")"
-            done < <(jq -c '.jobs[] | select(.conclusion == "failure") | {id, name}' <<<"$jobs")
-          fi
-          log_tail="$(tail -c 14000 <<<"$log_tail")"
           repo_name="${REPO##*/}"
           payload="$(jq -nc \
             --arg service "ci:$repo_name" \
             --arg digest "$WORKFLOW_NAME:$RUN_ID" \
             --arg snapshot "run_url=$RUN_URL conclusion=$CONCLUSION" \
-            --arg log_tail "$log_tail" \
-            '{service:$service,digest:$digest,anomaly_class:"ci_failure",health_snapshot:$snapshot,log_tail:$log_tail}')"
-          response="$(curl --fail-with-body --silent --show-error \
-            --config <(printf 'header = "Cookie: translatent_session=%s"\n' "$FORGE_ANOMALY_TOKEN") \
-            -H 'Content-Type: application/json' \
-            --data "$payload" \
-            https://forge.translatent.ai/api/intake/anomaly)"
+            --arg log_tail "$LOG_TAIL" \
+            --arg branch "$HEAD_BRANCH" \
+            --arg head_sha "$HEAD_SHA" \
+            '{service:$service,digest:$digest,anomaly_class:"ci_failure",health_snapshot:$snapshot,log_tail:$log_tail,branch:$branch,head_sha:$head_sha}')"
+          jq -e --arg branch "$HEAD_BRANCH" --arg head_sha "$HEAD_SHA" \
+            '.branch == $branch and .head_sha == $head_sha and (.log_tail | length) > 0' <<<"$payload" >/dev/null
+          if [ "$HEAD_BRANCH" == main ]; then
+            response="$(curl --fail-with-body --silent --show-error \
+              --config <(printf 'header = "Cookie: translatent_session=%s"\n' "$FORGE_ANOMALY_TOKEN") \
+              -H 'Content-Type: application/json' \
+              --data "$payload" \
+              https://forge.translatent.ai/api/intake/anomaly)"
+          else
+            # The deliberate e2e failure exercises collection and payload
+            # validation, but must never create a production anomaly.
+            exit 0
+          fi
           normalize_component() {
             printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g' | awk '
             {

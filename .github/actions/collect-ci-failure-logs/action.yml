@@ -1,0 +1,38 @@
+name: Collect CI failure logs
+description: Download and select bounded failure context for every failed job
+inputs:
+  token:
+    required: true
+    description: GitHub token with Actions read access
+  repo:
+    required: true
+    description: Repository in owner/name form
+  run-id:
+    required: true
+    description: Failed Actions run ID
+outputs:
+  log-tail:
+    description: Failed job names and bounded per-job failure context
+    value: ${{ steps.collect.outputs.log-tail }}
+runs:
+  using: composite
+  steps:
+    - id: collect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        RUN_ID: ${{ inputs.run-id }}
+      run: |
+        set -euo pipefail
+        jobs="$(curl --fail-with-body --silent --show-error \
+          -H "Authorization: Bearer $GH_TOKEN" \
+          -H 'Accept: application/vnd.github+json' \
+          -H 'X-GitHub-Api-Version: 2022-11-28' \
+          "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100")"
+        delimiter="ci-log-$(openssl rand -hex 16)"
+        {
+          printf 'log-tail<<%s\n' "$delimiter"
+          printf '%s' "$jobs" | "$GITHUB_ACTION_PATH/collect-ci-failure-logs.sh"
+          printf '\n%s\n' "$delimiter"
+        } >>"$GITHUB_OUTPUT"
