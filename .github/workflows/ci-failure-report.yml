@@ -21,7 +21,7 @@ jobs:
     uses: ./.github/workflows/report-ci-failure.yml
     with:
       repo: ${{ github.repository }}
-      workflow_name: ${{ github.event.workflow_run.name }}
+      workflow_path: ${{ github.event.workflow_run.path }}
       run_id: ${{ github.event.workflow_run.id }}
       run_url: ${{ github.event.workflow_run.html_url }}
       conclusion: ${{ github.event.workflow_run.conclusion }}
