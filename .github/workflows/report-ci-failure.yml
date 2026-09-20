@@ -31,6 +31,7 @@ permissions:
 
 jobs:
   report:
+    timeout-minutes: 15
     # The reporter must not share the Linux scaleset whose failures it reports.
     runs-on: ubuntu-latest
     steps:

@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   lint:
+    timeout-minutes: 15
     name: Lint
     runs-on: ubuntu-latest
     steps:
@@ -62,6 +63,7 @@ jobs:
           fi
 
   test:
+    timeout-minutes: 15
     name: Test
     runs-on: ubuntu-latest
     steps:
@@ -127,6 +129,7 @@ jobs:
           retention-days: 7
 
   e2e:
+    timeout-minutes: 15
     name: E2E
     runs-on: ubuntu-latest
     steps:
@@ -143,6 +146,7 @@ jobs:
         run: go test -tags=e2e -race -timeout=10m ./test/e2e/...
 
   build:
+    timeout-minutes: 15
     name: Build
     runs-on: ubuntu-latest
     steps:
@@ -169,6 +173,7 @@ jobs:
           repo-checkout: false
 
   helm-lint:
+    timeout-minutes: 15
     name: Helm Lint
     runs-on: ubuntu-latest
     steps:
