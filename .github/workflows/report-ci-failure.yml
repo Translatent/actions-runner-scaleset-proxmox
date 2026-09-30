@@ -9,8 +9,13 @@ on:
         required: true
         type: string
       workflow_name:
-        required: true
+        required: false
         type: string
+        default: ""
+      workflow_path:
+        required: false
+        type: string
+        default: ""
       run_id:
         required: true
         type: string
@@ -42,12 +47,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ inputs.repo }}
           WORKFLOW_NAME: ${{ inputs.workflow_name }}
+          WORKFLOW_PATH: ${{ inputs.workflow_path }}
           RUN_ID: ${{ inputs.run_id }}
           RUN_URL: ${{ inputs.run_url }}
           CONCLUSION: ${{ inputs.conclusion }}
           FORGE_ANOMALY_TOKEN: ${{ secrets.FORGE_ANOMALY_TOKEN }}
         run: |
           set -euo pipefail
+          # The stable workflow file path always wins; a custom run name is only
+          # a fallback, and even then only its leading token is used so a per-run
+          # SHA/ref/dispatch tail cannot leak into the anomaly identity.
+          workflow_key="$WORKFLOW_PATH"
+          if [ -z "$workflow_key" ]; then
+            workflow_key="${WORKFLOW_NAME%% *}"
+          fi
+          workflow_key="${workflow_key##*/}"
+          workflow_key="${workflow_key%.yml}"
+          workflow_key="${workflow_key%.yaml}"
+          [ -n "$workflow_key" ] || { echo "workflow identity is required" >&2; exit 1; }
           jobs="$(curl --fail-with-body --silent --show-error \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H 'Accept: application/vnd.github+json' \
@@ -73,7 +90,7 @@ jobs:
           repo_name="${REPO##*/}"
           payload="$(jq -nc \
             --arg service "ci:$repo_name" \
-            --arg digest "$WORKFLOW_NAME:$RUN_ID" \
+            --arg digest "$workflow_key:$RUN_ID" \
             --arg snapshot "run_url=$RUN_URL conclusion=$CONCLUSION" \
             --arg log_tail "$log_tail" \
             '{service:$service,digest:$digest,anomaly_class:"ci_failure",health_snapshot:$snapshot,log_tail:$log_tail}')"
@@ -96,7 +113,7 @@ jobs:
             }'
           }
           repo_component="$(normalize_component "$repo_name")"
-          workflow_component="$(normalize_component "$WORKFLOW_NAME")"
+          workflow_component="$(normalize_component "$workflow_key")"
           expected_fingerprint="anomaly:ci_failure:ci:$repo_component:$workflow_component"
           jq -e --arg fingerprint "$expected_fingerprint" '
             .fingerprint == $fingerprint and
