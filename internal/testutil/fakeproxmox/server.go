@@ -623,6 +623,9 @@ func (s *Server) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 		if f, ok := s.store.matchFaultLocked(FaultTaskFails, taskVMID); ok && (f.TaskType == "" || f.TaskType == t.Type) {
 			exit = "TASK ERROR: injected " + t.Type + " failure"
 		}
+		if f, ok := s.store.matchFaultLocked(FaultTaskWarns, taskVMID); ok && (f.TaskType == "" || f.TaskType == t.Type) {
+			exit = "WARNINGS: 1"
+		}
 	}
 	writeData(w, map[string]any{
 		"upid":       t.UPID,

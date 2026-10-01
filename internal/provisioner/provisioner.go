@@ -914,6 +914,21 @@ func (p *pmox) DestroyWithOutcome(ctx context.Context, vm *VM) (DestroyOutcome, 
 			p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
 			return DestroyOutcomeNotFound, nil
 		}
+		// qmdestroy ends with "WARNINGS: n" when it removed the VM but not
+		// every disk (pve2 storage-lock timeouts under concurrent clones,
+		// 2026-09-30). The VM is gone once the ownership pool no longer
+		// lists it; the leftover volume is the disk reaper's. Treating it
+		// as a failure made the retry hit a 403 on the vanished VM.
+		if strings.HasPrefix(task.ExitStatus, "WARNINGS") {
+			member, memberErr := p.isOwnershipPoolMember(ctx, vm.VMID)
+			if memberErr == nil && !member {
+				p.log.Warn("destroy completed with warnings; leftover volumes go to the disk reaper",
+					"vmid", vm.VMID, "exitstatus", task.ExitStatus)
+				p.inFlightClones.Delete(vm.VMID)
+				p.recentlyDestroyed.Set(vm.VMID, time.Now(), ttlcache.DefaultTTL)
+				return "", nil
+			}
+		}
 		return "", fmt.Errorf("await delete: %w", classified)
 	}
 	p.inFlightClones.Delete(vm.VMID)

@@ -63,6 +63,12 @@ const (
 	// the orchestrator's full inject → retry → mark-completed →
 	// destroy chain.
 	FaultJITInjectFail
+
+	// FaultTaskWarns makes the matched task complete with exitstatus
+	// "WARNINGS: 1", as real qmdestroy does when it removes the VM but
+	// cannot remove a disk (storage lock timeout). TaskType restricts it
+	// like FaultTaskFails.
+	FaultTaskWarns
 )
 
 // Fault describes a single injected failure. Match semantics:

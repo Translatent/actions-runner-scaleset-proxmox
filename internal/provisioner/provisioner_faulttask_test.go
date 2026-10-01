@@ -75,3 +75,16 @@ func TestAwaitTask_DestroyTaskFailureSurfacesError(t *testing.T) {
 	require.True(t, strings.Contains(err.Error(), "delete") || strings.Contains(err.Error(), "destroy"),
 		"destroy error should mention the failed delete/destroy task, got: %v", err)
 }
+
+func TestDestroy_TaskWarningsWithVMGoneIsSuccess(t *testing.T) {
+	t.Parallel()
+	fp := fakeproxmox.New(t, fakeproxmox.Options{})
+	fp.SeedVM("pve1", 10042, "x", true /* running */, []string{"gh-scaleset", "gh-scaleset-owner-test-scaleset"})
+	fp.InjectFault(fakeproxmox.Fault{Kind: fakeproxmox.FaultTaskWarns, TaskType: "qmdestroy"})
+
+	p := newFaultProvisioner(t, fp)
+	outcome, err := p.DestroyWithOutcome(context.Background(), &VM{VMID: 10042, Node: "pve1"})
+	require.NoError(t, err, "qmdestroy WARNINGS with the VM gone from the pool is a completed destroy")
+	require.Equal(t, DestroyOutcome(""), outcome)
+	require.True(t, p.recentlyDestroyed.Has(10042), "VMID must enter the reuse cooldown")
+}
