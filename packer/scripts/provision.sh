@@ -30,9 +30,9 @@ log "waiting for cloud-init to finish"
 cloud-init status --wait || true
 
 log "waiting for apt locks"
-while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-   || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-    sleep 2
+while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ||
+  fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+  sleep 2
 done
 
 export DEBIAN_FRONTEND=noninteractive
@@ -43,18 +43,18 @@ export DEBIAN_FRONTEND=noninteractive
 log "updating apt cache + installing baseline packages"
 apt-get update
 apt-get install -y --no-install-recommends \
-    qemu-guest-agent \
-    ca-certificates \
-    curl \
-    git \
-    jq \
-    sudo \
-    iproute2 \
-    iputils-ping \
-    netcat-openbsd \
-    unzip \
-    xz-utils \
-    libicu-dev   # required by the Actions runner's .NET runtime
+  qemu-guest-agent \
+  ca-certificates \
+  curl \
+  git \
+  jq \
+  sudo \
+  iproute2 \
+  iputils-ping \
+  netcat-openbsd \
+  unzip \
+  xz-utils \
+  libicu-dev # required by the Actions runner's .NET runtime
 
 systemctl enable --now qemu-guest-agent
 log "qemu-guest-agent active"
@@ -64,7 +64,7 @@ log "qemu-guest-agent active"
 # -----------------------------------------------------------------------------
 log "creating runner user ${RUNNER_USER}"
 if ! id "${RUNNER_USER}" >/dev/null 2>&1; then
-    useradd --create-home --shell /bin/bash "${RUNNER_USER}"
+  useradd --create-home --shell /bin/bash "${RUNNER_USER}"
 fi
 # Lock the password so console / SSH password login is impossible.
 passwd -l "${RUNNER_USER}" || true
@@ -86,7 +86,7 @@ TARBALL="actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
 URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}"
 
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-     -o "/tmp/${TARBALL}" "${URL}"
+  -o "/tmp/${TARBALL}" "${URL}"
 tar -xzf "/tmp/${TARBALL}" -C /opt/actions-runner
 rm -f "/tmp/${TARBALL}"
 chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/actions-runner
@@ -103,7 +103,7 @@ test ! -e /opt/actions-runner/jitconfig.env
 # systemd units.
 # -----------------------------------------------------------------------------
 log "installing gh-runner.{path,service}"
-install -m 0644 "${STAGE_DIR}/gh-runner.path"    /etc/systemd/system/gh-runner.path
+install -m 0644 "${STAGE_DIR}/gh-runner.path" /etc/systemd/system/gh-runner.path
 install -m 0644 "${STAGE_DIR}/gh-runner.service" /etc/systemd/system/gh-runner.service
 systemctl daemon-reload
 # Only the path unit is enabled — it'll start the service when the
@@ -198,14 +198,13 @@ rm -rf /root/snap /home/*/snap /var/cache/snapd
 
 # Pollyfilly services we don't need on an ephemeral runner.
 for svc in \
-    multipathd.service \
-    iscsid.service iscsid.socket open-iscsi.service \
-    ModemManager.service \
-    unattended-upgrades.service apt-daily.service apt-daily-upgrade.service \
-    apt-daily.timer apt-daily-upgrade.timer
-do
-    systemctl disable --now "${svc}" 2>/dev/null || true
-    systemctl mask         "${svc}" 2>/dev/null || true
+  multipathd.service \
+  iscsid.service iscsid.socket open-iscsi.service \
+  ModemManager.service \
+  unattended-upgrades.service apt-daily.service apt-daily-upgrade.service \
+  apt-daily.timer apt-daily-upgrade.timer; do
+  systemctl disable --now "${svc}" 2>/dev/null || true
+  systemctl mask "${svc}" 2>/dev/null || true
 done
 
 # -----------------------------------------------------------------------------
@@ -213,11 +212,11 @@ done
 # -----------------------------------------------------------------------------
 log "tightening login defaults"
 sed -i \
-    -e 's/^UMASK\s\+.*/UMASK\t\t027/' \
-    -e 's/^PASS_MAX_DAYS\s\+.*/PASS_MAX_DAYS\t90/' \
-    -e 's/^PASS_MIN_DAYS\s\+.*/PASS_MIN_DAYS\t1/' \
-    -e 's/^PASS_WARN_AGE\s\+.*/PASS_WARN_AGE\t14/' \
-    /etc/login.defs
+  -e 's/^UMASK\s\+.*/UMASK\t\t027/' \
+  -e 's/^PASS_MAX_DAYS\s\+.*/PASS_MAX_DAYS\t90/' \
+  -e 's/^PASS_MIN_DAYS\s\+.*/PASS_MIN_DAYS\t1/' \
+  -e 's/^PASS_WARN_AGE\s\+.*/PASS_WARN_AGE\t14/' \
+  /etc/login.defs
 
 # Disable core dumps via limits.conf (sysctl drop-in already disables suid_dumpable).
 cat >/etc/security/limits.d/99-no-core.conf <<'EOF'
@@ -279,10 +278,10 @@ cloud-init clean --logs --machine-id 2>/dev/null || cloud-init clean --logs || t
 # -----------------------------------------------------------------------------
 log "locking + de-privileging the build user (${BUILD_USERNAME})"
 if id "${BUILD_USERNAME}" >/dev/null 2>&1; then
-    # Lock the password so the account can't be used to log in.
-    passwd -l "${BUILD_USERNAME}" || true
-    # Remove the user from sudo group entirely.
-    deluser "${BUILD_USERNAME}" sudo 2>/dev/null || true
+  # Lock the password so the account can't be used to log in.
+  passwd -l "${BUILD_USERNAME}" || true
+  # Remove the user from sudo group entirely.
+  deluser "${BUILD_USERNAME}" sudo 2>/dev/null || true
 fi
 
 # TRIM the disk so Proxmox can compact the template.
