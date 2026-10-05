@@ -1,0 +1,19 @@
+# Formatting is part of CI (formatting-everywhere).
+name: format
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Translatent/translatent-deploy-config/.github/actions/shell-format-check@main
