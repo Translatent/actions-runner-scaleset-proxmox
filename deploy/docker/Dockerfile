@@ -3,7 +3,7 @@
 # ---------- builder ----------
 # Digest-pinned for reproducible, tamper-evident builds (tags are
 # mutable). Tag kept inline for readability; bump both together.
-FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS builder
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS builder
 WORKDIR /src
 RUN apk add --no-cache ca-certificates
 

@@ -4,7 +4,11 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -98,4 +102,54 @@ func TestInitTracer_EnabledBuildsProvider(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // immediately cancel so the BatchSpanProcessor doesn't block on export
 	_ = shutdown(ctx)
+}
+
+func TestInitTracer_ExportsToDefaultTracePath(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
+	provider := otel.GetTracerProvider()
+	propagator := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(provider)
+		otel.SetTextMapPropagator(propagator)
+	})
+
+	type request struct {
+		method string
+		path   string
+	}
+	requests := make(chan request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			t.Errorf("read exported spans: %v", err)
+		}
+		select {
+		case requests <- request{method: r.Method, path: r.URL.Path}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	shutdown, err := observability.InitTracer(ctx, observability.TracingOptions{
+		Endpoint:       strings.TrimPrefix(server.URL, "http://"),
+		Insecure:       true,
+		SampleRatio:    1,
+		ServiceName:    "scaleset-test",
+		ServiceVersion: "test",
+	}, discardLogger())
+	require.NoError(t, err)
+	_, span := otel.Tracer(observability.TracerName).Start(ctx, "test-export")
+	span.End()
+	require.NoError(t, shutdown(ctx))
+	select {
+	case got := <-requests:
+		require.Equal(t, http.MethodPost, got.method)
+		require.Equal(t, "/v1/traces", got.path)
+	default:
+		t.Fatal("shutdown did not flush the recorded span")
+	}
 }
