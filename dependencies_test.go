@@ -34,9 +34,9 @@ func TestHTTP2SecurityBaseline(t *testing.T) {
 		}
 	}
 	t.Run("Go", func(t *testing.T) {
-		if !version.IsValid(goVersion) || version.Compare(goVersion, "go1.26.10") < 0 ||
-			(version.Compare(goVersion, "go1.27") >= 0 && version.Compare(goVersion, "go1.27.3") < 0) {
-			t.Errorf("Go %q fails the GO-2026-6617/GO-2026-6809 baseline; require Go 1.26.10 or a later fixed release", goVersion)
+		if !version.IsValid(goVersion) || version.Compare(goVersion, "go1.26.11") < 0 ||
+			(version.Compare(goVersion, "go1.27") >= 0 && version.Compare(goVersion, "go1.27.4") < 0) {
+			t.Errorf("Go %q fails the GO-2026-6617/GO-2026-6809/GO-2026-6859 baseline; require Go 1.26.11 or a later fixed release", goVersion)
 		}
 	})
 	// These minimums fix GO-2026-6617 (x/net), GO-2026-6348,

@@ -1,6 +1,6 @@
 module github.com/jeffresc/actions-runner-scaleset-proxmox
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/actions/scaleset v0.4.0
