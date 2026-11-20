@@ -12,8 +12,29 @@ permissions:
 
 jobs:
   shell:
-    runs-on: [self-hosted, linux, x64]
+    # This repository is public: the self-hosted runner groups do not serve it (hosted minutes are free
+    # for public repositories), and it cannot use actions from the private translatent-deploy-config. So
+    # the check runs on a hosted runner and repeats that repository's shell-format-check action inline:
+    # the pinned, checksum-verified shfmt with the fleet style (-i 2 -ci).
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: Translatent/translatent-deploy-config/.github/actions/shell-format-check@main
+      - name: Shell scripts match pinned shfmt (-i 2 -ci)
+        env:
+          SHFMT_VERSION: v3.14.1
+          SHFMT_SHA256: 76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/shfmt"
+          curl -fsSL -o "$bin" "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          [[ "$(sha256sum "$bin" | cut -d' ' -f1)" == "$SHFMT_SHA256" ]] || { echo "::error::shfmt checksum mismatch"; exit 1; }
+          chmod +x "$bin"
+          git ls-files > "$RUNNER_TEMP/tracked"
+          "$bin" -f . > "$RUNNER_TEMP/walked" 2>/dev/null || true
+          grep -Fxf "$RUNNER_TEMP/tracked" "$RUNNER_TEMP/walked" > "$RUNNER_TEMP/shell-files" || true
+          [[ -s "$RUNNER_TEMP/shell-files" ]] || { echo "No shell scripts."; exit 0; }
+          if ! tr '\n' '\0' < "$RUNNER_TEMP/shell-files" | xargs -0 "$bin" -d -i 2 -ci; then
+            echo "::error::Shell scripts are not formatted. Run: git ls-files -z | xargs -0 shfmt -f | xargs shfmt -w -i 2 -ci  (shfmt ${SHFMT_VERSION})"
+            exit 1
+          fi
